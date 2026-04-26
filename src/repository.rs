@@ -84,9 +84,10 @@ fn scan_local_song_dirs(songs_dir: &Path) -> Vec<SongEntry> {
             continue;
         }
 
-        let Some(tja_path) = first_with_ext(&path, "tja") else {
+        let tja_files = all_with_ext(&path, "tja");
+        if tja_files.is_empty() {
             continue;
-        };
+        }
         let audio_path = first_audio(&path);
 
         let name = path
@@ -95,19 +96,41 @@ fn scan_local_song_dirs(songs_dir: &Path) -> Vec<SongEntry> {
             .unwrap_or("unknown")
             .to_string();
 
-        result.push(SongEntry {
-            song_id: name.clone(),
-            title: name,
-            tja_path,
-            audio_path,
-        });
+        let multi = tja_files.len() > 1;
+        for tja_path in tja_files {
+            let stem = tja_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("chart")
+                .to_string();
+
+            let title = if multi {
+                format!("{} / {}", name, stem)
+            } else {
+                name.clone()
+            };
+
+            result.push(SongEntry {
+                song_id: format!("{}:{}", name, stem),
+                title,
+                tja_path,
+                audio_path: audio_path.clone(),
+            });
+        }
     }
 
     result
 }
 
 fn first_with_ext(dir: &Path, ext: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(dir).ok()?;
+    all_with_ext(dir, ext).into_iter().next()
+}
+
+fn all_with_ext(dir: &Path, ext: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path
@@ -116,10 +139,11 @@ fn first_with_ext(dir: &Path, ext: &str) -> Option<PathBuf> {
             .map(|s| s.eq_ignore_ascii_case(ext))
             .unwrap_or(false)
         {
-            return Some(path);
+            out.push(path);
         }
     }
-    None
+    out.sort();
+    out
 }
 
 fn first_audio(dir: &Path) -> Option<PathBuf> {

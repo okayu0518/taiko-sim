@@ -4,14 +4,29 @@ mod repository;
 mod tja_parser;
 
 use game::TaikoSimApp;
+use serde::Deserialize;
+
+#[derive(Deserialize, Default)]
+struct BootstrapConfig {
+    vsync: Option<bool>,
+}
 
 fn window_conf() -> macroquad::prelude::Conf {
-    macroquad::prelude::Conf {
+    let cfg = std::fs::read_to_string("config.json")
+        .ok()
+        .and_then(|raw| serde_json::from_str::<BootstrapConfig>(&raw).ok())
+        .unwrap_or_default();
+    let vsync = cfg.vsync.unwrap_or(true);
+
+    let mut conf = macroquad::prelude::Conf {
         window_title: "taikosim".to_owned(),
         window_width: 1280,
         window_height: 720,
+        window_resizable: true,
         ..Default::default()
-    }
+    };
+    conf.platform.swap_interval = Some(if vsync { 1 } else { 0 });
+    conf
 }
 
 #[macroquad::main(window_conf)]

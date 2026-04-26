@@ -23,12 +23,21 @@ pub struct Note {
 }
 
 #[derive(Clone)]
+pub struct Roll {
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub big: bool,
+    pub balloon: bool,
+}
+
+#[derive(Clone)]
 pub struct Chart {
     pub title: String,
     pub course: String,
     pub level: i32,
     pub offset_sec: f64,
     pub notes: Vec<Note>,
+    pub rolls: Vec<Roll>,
     pub duration_sec: f64,
 }
 

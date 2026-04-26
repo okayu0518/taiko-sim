@@ -3,7 +3,7 @@ use std::path::Path;
 
 use encoding_rs::{SHIFT_JIS, UTF_8};
 
-use crate::models::{Chart, Note, NoteKind};
+use crate::models::{Chart, Note, NoteKind, Roll};
 
 const COURSE_PRIORITY: [&str; 4] = ["oni", "hard", "normal", "easy"];
 
@@ -167,6 +167,8 @@ fn build_chart(
     }
 
     let mut notes = Vec::new();
+    let mut rolls = Vec::new();
+    let mut open_rolls: Vec<(f64, bool, bool)> = Vec::new();
     let mut current_time = 0.0_f64;
     let mut current_bpm = bpm;
     let mut measure_num = 4_i32;
@@ -206,6 +208,8 @@ fn build_chart(
                 current_time = consume_measure(
                     &measure_buf,
                     &mut notes,
+                    &mut rolls,
+                    &mut open_rolls,
                     current_time,
                     current_bpm,
                     measure_num,
@@ -222,11 +226,22 @@ fn build_chart(
         current_time = consume_measure(
             &measure_buf,
             &mut notes,
+            &mut rolls,
+            &mut open_rolls,
             current_time,
             current_bpm,
             measure_num,
             measure_den,
         );
+    }
+
+    while let Some((start, big, balloon)) = open_rolls.pop() {
+        rolls.push(Roll {
+            start_sec: start,
+            end_sec: current_time,
+            big,
+            balloon,
+        });
     }
 
     let duration_sec = current_time + 2.0;
@@ -236,6 +251,7 @@ fn build_chart(
         level,
         offset_sec,
         notes,
+        rolls,
         duration_sec,
     })
 }
@@ -243,6 +259,8 @@ fn build_chart(
 fn consume_measure(
     measure_buf: &str,
     notes: &mut Vec<Note>,
+    rolls: &mut Vec<Roll>,
+    open_rolls: &mut Vec<(f64, bool, bool)>,
     current_time: f64,
     bpm: f64,
     measure_num: i32,
@@ -257,26 +275,38 @@ fn consume_measure(
 
     let step = measure_sec / measure_buf.len() as f64;
     for (idx, ch) in measure_buf.chars().enumerate() {
-        let kind = digit_to_kind(ch);
-        if let Some(k) = kind {
-            notes.push(Note {
-                time_sec: current_time + idx as f64 * step,
-                kind: k,
+        let note_time = current_time + idx as f64 * step;
+        match ch {
+            '1' | '3' => notes.push(Note {
+                time_sec: note_time,
+                kind: NoteKind::Don,
                 judged: false,
                 hit: false,
-            });
+            }),
+            '2' | '4' => notes.push(Note {
+                time_sec: note_time,
+                kind: NoteKind::Kat,
+                judged: false,
+                hit: false,
+            }),
+            '5' => open_rolls.push((note_time, false, false)),
+            '6' => open_rolls.push((note_time, true, false)),
+            '7' | '9' => open_rolls.push((note_time, true, true)),
+            '8' => {
+                if let Some((start, big, balloon)) = open_rolls.pop() {
+                    rolls.push(Roll {
+                        start_sec: start,
+                        end_sec: note_time,
+                        big,
+                        balloon,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 
     current_time + measure_sec
-}
-
-fn digit_to_kind(ch: char) -> Option<NoteKind> {
-    match ch {
-        '1' | '3' => Some(NoteKind::Don),
-        '2' | '4' => Some(NoteKind::Kat),
-        _ => None,
-    }
 }
 
 fn clean_line(raw: &str) -> String {
