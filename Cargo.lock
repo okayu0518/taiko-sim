@@ -975,6 +975,7 @@ dependencies = [
 name = "taikosim"
 version = "0.1.0"
 dependencies = [
+ "cpal",
  "encoding_rs",
  "macroquad",
  "rodio",

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use encoding_rs::{SHIFT_JIS, UTF_8};
 
-use crate::models::{Chart, Note, NoteKind, Roll};
+use crate::models::{Branch, BranchPoint, Chart, Note, NoteKind, Roll};
 
 const COURSE_PRIORITY: [&str; 4] = ["oni", "hard", "normal", "easy"];
 
@@ -168,9 +168,15 @@ fn build_chart(
 
     let mut notes = Vec::new();
     let mut rolls = Vec::new();
-    let mut open_rolls: Vec<(f64, bool, bool)> = Vec::new();
+    let mut branch_points = Vec::new();
+    let mut has_branch = false;
+    let mut current_branch: Option<Branch> = None;
+    let mut branch_start_time: Option<f64> = None;
+    let mut max_branch_time = 0.0_f64;
+    let mut open_rolls: Vec<(f64, bool, bool, Option<Branch>)> = Vec::new();
     let mut current_time = 0.0_f64;
     let mut current_bpm = bpm;
+    let mut current_scroll = 1.0_f64;
     let mut measure_num = 4_i32;
     let mut measure_den = 4_i32;
     let mut measure_buf = String::new();
@@ -183,6 +189,11 @@ fn build_chart(
                 let value = cmd[9..].trim();
                 if let Ok(v) = value.parse::<f64>() {
                     current_bpm = v.max(1e-6);
+                }
+            } else if cmd_upper.starts_with("SCROLL") {
+                let value = cmd[6..].trim();
+                if let Ok(v) = value.parse::<f64>() {
+                    current_scroll = v;
                 }
             } else if cmd_upper.starts_with("MEASURE") {
                 let value = cmd[7..].trim();
@@ -199,6 +210,55 @@ fn build_chart(
                 if let Ok(v) = value.parse::<f64>() {
                     current_time += v;
                 }
+            } else if cmd_upper.starts_with("BRANCHSTART") {
+                has_branch = true;
+                branch_start_time = Some(current_time);
+                max_branch_time = current_time;
+                let args = cmd[11..].trim();
+                let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
+                if parts.len() >= 3 {
+                    let req_type = parts[0].chars().next().unwrap_or('p');
+                    let expert_threshold = parts[1].parse::<f64>().unwrap_or(0.0);
+                    let master_threshold = parts[2].parse::<f64>().unwrap_or(0.0);
+                    branch_points.push(BranchPoint {
+                        time_sec: current_time,
+                        requirement_type: req_type,
+                        expert_threshold,
+                        master_threshold,
+                    });
+                }
+            } else if cmd_upper == "N" {
+                if let Some(_start) = branch_start_time {
+                    max_branch_time = max_branch_time.max(current_time);
+                    current_time = _start;
+                }
+                current_branch = Some(Branch::Normal);
+            } else if cmd_upper == "E" {
+                if let Some(_start) = branch_start_time {
+                    max_branch_time = max_branch_time.max(current_time);
+                    current_time = _start;
+                }
+                current_branch = Some(Branch::Expert);
+            } else if cmd_upper == "M" {
+                if let Some(_start) = branch_start_time {
+                    max_branch_time = max_branch_time.max(current_time);
+                    current_time = _start;
+                }
+                current_branch = Some(Branch::Master);
+            } else if cmd_upper == "BRANCHEND" {
+                if let Some(_start) = branch_start_time {
+                    max_branch_time = max_branch_time.max(current_time);
+                    current_time = max_branch_time;
+                    branch_start_time = None;
+                }
+                current_branch = None;
+            } else if cmd_upper == "SECTION" {
+                branch_points.push(BranchPoint {
+                    time_sec: current_time,
+                    requirement_type: 's', // section reset
+                    expert_threshold: 0.0,
+                    master_threshold: 0.0,
+                });
             }
             continue;
         }
@@ -212,8 +272,10 @@ fn build_chart(
                     &mut open_rolls,
                     current_time,
                     current_bpm,
+                    current_scroll,
                     measure_num,
                     measure_den,
+                    current_branch,
                 );
                 measure_buf.clear();
             } else if ch.is_ascii_digit() {
@@ -230,17 +292,21 @@ fn build_chart(
             &mut open_rolls,
             current_time,
             current_bpm,
+            current_scroll,
             measure_num,
             measure_den,
+            current_branch,
         );
     }
 
-    while let Some((start, big, balloon)) = open_rolls.pop() {
+    while let Some((start, big, balloon, branch)) = open_rolls.pop() {
         rolls.push(Roll {
             start_sec: start,
             end_sec: current_time,
             big,
             balloon,
+            branch,
+            scroll_speed: current_scroll,
         });
     }
 
@@ -252,6 +318,8 @@ fn build_chart(
         offset_sec,
         notes,
         rolls,
+        branch_points,
+        has_branch,
         duration_sec,
     })
 }
@@ -260,11 +328,13 @@ fn consume_measure(
     measure_buf: &str,
     notes: &mut Vec<Note>,
     rolls: &mut Vec<Roll>,
-    open_rolls: &mut Vec<(f64, bool, bool)>,
+    open_rolls: &mut Vec<(f64, bool, bool, Option<Branch>)>,
     current_time: f64,
     bpm: f64,
+    scroll: f64,
     measure_num: i32,
     measure_den: i32,
+    branch: Option<Branch>,
 ) -> f64 {
     let beat_sec = 60.0 / bpm.max(1e-6);
     let measure_sec = beat_sec * 4.0 * (measure_num as f64 / measure_den.max(1) as f64);
@@ -282,23 +352,29 @@ fn consume_measure(
                 kind: NoteKind::Don,
                 judged: false,
                 hit: false,
+                branch,
+                scroll_speed: scroll,
             }),
             '2' | '4' => notes.push(Note {
                 time_sec: note_time,
                 kind: NoteKind::Kat,
                 judged: false,
                 hit: false,
+                branch,
+                scroll_speed: scroll,
             }),
-            '5' => open_rolls.push((note_time, false, false)),
-            '6' => open_rolls.push((note_time, true, false)),
-            '7' | '9' => open_rolls.push((note_time, true, true)),
+            '5' => open_rolls.push((note_time, false, false, branch)),
+            '6' => open_rolls.push((note_time, true, false, branch)),
+            '7' | '9' => open_rolls.push((note_time, true, true, branch)),
             '8' => {
-                if let Some((start, big, balloon)) = open_rolls.pop() {
+                if let Some((start, big, balloon, b)) = open_rolls.pop() {
                     rolls.push(Roll {
                         start_sec: start,
                         end_sec: note_time,
                         big,
                         balloon,
+                        branch: b,
+                        scroll_speed: scroll,
                     });
                 }
             }
