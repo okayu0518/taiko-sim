@@ -40,10 +40,12 @@ enum Scene {
 #[derive(Clone)]
 struct SeData {
     samples: Arc<[f32]>,
+    sample_rate: u32,
 }
 
 struct SeSource {
     data: Arc<[f32]>,
+    sample_rate: u32,
     idx: usize,
     gain: f32,
     triggered_at: Instant,
@@ -74,7 +76,7 @@ impl Source for SeSource {
         Some(self.data.len().saturating_sub(self.idx))
     }
     fn channels(&self) -> u16 { 1 }
-    fn sample_rate(&self) -> u32 { 48_000 }
+    fn sample_rate(&self) -> u32 { self.sample_rate }
     fn total_duration(&self) -> Option<Duration> { None }
 }
 
@@ -576,13 +578,16 @@ impl TaikoSimApp {
             self.draw_ui_text(&format!("FPS: {}", get_fps()), 1030.0, 40.0, 24, Color::from_rgba(170, 255, 170, 255));
             self.draw_ui_text(&format!("Time: {:.3}s", now), 1030.0, 68.0, 24, Color::from_rgba(170, 255, 170, 255));
             self.draw_ui_text(&format!("SE Latency ms  last:{:.1} avg:{:.1} max:{:.1} n:{}", last_ms, avg_ms, max_ms, n), 700.0, 96.0, 24, Color::from_rgba(170, 255, 170, 255));
+            if let Some(se) = &self.se_don {
+                self.draw_ui_text(&format!("SE SampleRate: {}Hz", se.sample_rate), 700.0, 124.0, 24, Color::from_rgba(170, 255, 170, 255));
+            }
             if chart.has_branch {
                 let total = self.section_perfect + self.section_good + self.section_miss;
                 let accuracy = if total == 0 { 0.0 } else {
                     (self.section_perfect as f64 + self.section_good as f64 * 0.5) / total as f64 * 100.0
                 };
-                self.draw_ui_text(&format!("Section: P:{} G:{} M:{} R:{}", self.section_perfect, self.section_good, self.section_miss, self.section_rolls), 700.0, 124.0, 24, Color::from_rgba(170, 255, 170, 255));
-                self.draw_ui_text(&format!("Accuracy: {:.1}%", accuracy), 700.0, 152.0, 24, Color::from_rgba(170, 255, 170, 255));
+                self.draw_ui_text(&format!("Section: P:{} G:{} M:{} R:{}", self.section_perfect, self.section_good, self.section_miss, self.section_rolls), 700.0, 152.0, 24, Color::from_rgba(170, 255, 170, 255));
+                self.draw_ui_text(&format!("Accuracy: {:.1}%", accuracy), 700.0, 180.0, 24, Color::from_rgba(170, 255, 170, 255));
             }
         }
     }
@@ -687,12 +692,15 @@ impl TaikoSimApp {
         let Some(se_data) = (if kind == NoteKind::Don { &self.se_don } else { &self.se_ka }).as_ref() else { return; };
 
         let source = SeSource {
-            data: se_data.samples.clone(), idx: 0,
+            data: se_data.samples.clone(),
+            sample_rate: se_data.sample_rate,
+            idx: 0,
             gain: self.config.se_volume.clamp(0.0, 2.0),
             triggered_at: Instant::now(), recorded: false,
             latency_stats: self.se_latency_stats.clone(),
         };
-        if let Ok(sink) = Sink::try_new(handle) { sink.append(source); sink.detach(); }
+        // Use play_raw to avoid Sink overhead
+        let _ = handle.play_raw(source);
     }
 
     fn ensure_bgm_output(&mut self) {
@@ -705,8 +713,9 @@ impl TaikoSimApp {
 fn load_se_data(path: &std::path::Path) -> Option<SeData> {
     let file = File::open(path).ok()?;
     let decoder = Decoder::new(BufReader::new(file)).ok()?;
+    let sample_rate = decoder.sample_rate();
     let samples: Vec<f32> = decoder.convert_samples::<f32>().collect();
-    Some(SeData { samples: Arc::from(samples.into_boxed_slice()) })
+    Some(SeData { samples: Arc::from(samples.into_boxed_slice()), sample_rate })
 }
 
 fn resolve_audio_path(song: &SongEntry, wave: Option<&str>) -> Option<PathBuf> {
