@@ -117,6 +117,14 @@ impl PlaySession {
         })
     }
 
+    /// Gogo ranges `(start, end)` in chart time on the branch being played.
+    pub fn active_gogo_ranges(&self) -> Vec<(f64, f64)> {
+        self.chart.gogo_ranges.iter()
+            .filter(|r| self.is_active(r.branch, r.start_sec))
+            .map(|r| (r.start_sec, r.end_sec))
+            .collect()
+    }
+
     /// The most recently decided branch (shown in the HUD).
     pub fn current_branch(&self) -> Branch {
         self.decided_branches.last().copied().unwrap_or(Branch::Normal)

@@ -10,7 +10,7 @@ use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 
 use crate::models::{AppConfig, KeybindConfig, NoteKind, ScoreState, ScrollSpeed, SongEntry};
 
-use crate::effects::{note_color, Effects};
+use crate::effects::{draw_gogo_flame, draw_gogo_lane, gogo_intensity, note_color, Effects};
 use crate::gameplay::{HitOutcome, PlaySession};
 use crate::judge::Judge;
 use crate::repository::load_song_entries;
@@ -379,8 +379,12 @@ impl TaikoSimApp {
         let lane_rect = Rect::new(LANE_X, LANE_Y - (LANE_H * 0.5), LANE_W, LANE_H);
         let target = vec2(TARGET_X, LANE_Y);
         let now = self.current_time_sec();
+        let chart_now = session.chart_time(now, offset);
+        let gogo = gogo_intensity(chart_now, &session.active_gogo_ranges());
         draw_rectangle(lane_rect.x, lane_rect.y, lane_rect.w, lane_rect.h, Color::from_rgba(39, 45, 56, 255));
+        draw_gogo_lane(lane_rect, gogo);
         self.effects.draw_under_notes(now, lane_rect);
+        draw_gogo_flame(target, JUDGE_RING_RADIUS, gogo, now);
         draw_circle(TARGET_X, LANE_Y, JUDGE_RING_RADIUS, Color::from_rgba(255, 245, 180, 30));
         draw_circle_lines(TARGET_X, LANE_Y, JUDGE_RING_RADIUS, 3.0, Color::from_rgba(255, 230, 140, 255));
 
@@ -428,6 +432,8 @@ impl TaikoSimApp {
                 self.draw_ui_text(&format!("Section: 良:{} 可:{} 不可:{} R:{}", section.perfect, section.good, section.miss, section.rolls), 700.0, 152.0, 24, Color::from_rgba(170, 255, 170, 255));
                 self.draw_ui_text(&format!("Accuracy: {:.1}%", section.accuracy()), 700.0, 180.0, 24, Color::from_rgba(170, 255, 170, 255));
             }
+            let gogo_label = if session.is_gogo_at(chart_now) { "ON" } else { "off" };
+            self.draw_ui_text(&format!("Gogo: {gogo_label}"), 700.0, 208.0, 24, Color::from_rgba(170, 255, 170, 255));
         }
     }
 

@@ -10,6 +10,11 @@ const LIFE_BURST: f64 = 0.25;
 const LIFE_JUDGE_TEXT: f64 = 0.40;
 const LIFE_FLYING_NOTE: f64 = 0.50;
 
+/// Fade in/out duration of the gogo time visuals.
+const GOGO_FADE_SEC: f64 = 0.15;
+/// Ranges closer than this are treated as continuous (e.g. split at branch boundaries).
+const GOGO_JOIN_EPS: f64 = 1e-6;
+
 /// Where hit notes fly to (base coordinates, top-right of the screen).
 const FLY_TARGET: Vec2 = Vec2::new(1180.0, 150.0);
 
@@ -142,6 +147,61 @@ impl Effects {
     }
 }
 
+/// Visual intensity (0..=1) of gogo time at `t`: fades in after a range starts
+/// and out after it ends. Contiguous ranges are joined so there is no dip between them.
+pub fn gogo_intensity(t: f64, ranges: &[(f64, f64)]) -> f32 {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut joined: Vec<(f64, f64)> = Vec::new();
+    for (start, end) in sorted {
+        match joined.last_mut() {
+            Some(last) if start <= last.1 + GOGO_JOIN_EPS => last.1 = last.1.max(end),
+            _ => joined.push((start, end)),
+        }
+    }
+
+    joined.iter().map(|&(start, end)| {
+        if t < start {
+            0.0
+        } else if t < end {
+            ((t - start) / GOGO_FADE_SEC).min(1.0)
+        } else {
+            (1.0 - (t - end) / GOGO_FADE_SEC).max(0.0)
+        }
+    }).fold(0.0, f64::max) as f32
+}
+
+/// Orange lane tint during gogo time.
+pub fn draw_gogo_lane(lane_rect: Rect, intensity: f32) {
+    if intensity <= 0.0 { return; }
+    let color = Color::from_rgba(255, 110, 30, 255);
+    draw_rectangle(lane_rect.x, lane_rect.y, lane_rect.w, lane_rect.h, with_alpha(color, 0.3 * intensity));
+}
+
+/// Flickering flame around the judge circle during gogo time. `time` drives the animation.
+pub fn draw_gogo_flame(center: Vec2, ring_radius: f32, intensity: f32, time: f64) {
+    if intensity <= 0.0 { return; }
+    let time = time as f32;
+
+    let glow_r = ring_radius + 22.0 + 4.0 * (time * 6.0).sin();
+    draw_circle(center.x, center.y, glow_r, with_alpha(Color::from_rgba(255, 90, 20, 255), 0.25 * intensity));
+    draw_circle(center.x, center.y, ring_radius + 12.0, with_alpha(Color::from_rgba(255, 170, 40, 255), 0.35 * intensity));
+
+    const TONGUES: usize = 12;
+    const HALF_WIDTH: f32 = 0.18;
+    let base_r = ring_radius + 6.0;
+    for i in 0..TONGUES {
+        let flicker = (time * 9.0 + i as f32 * 1.7).sin() * 0.5 + 0.5;
+        let angle = i as f32 / TONGUES as f32 * TAU + time * 0.8;
+        let len = 14.0 + 12.0 * flicker;
+        let left = center + Vec2::from_angle(angle - HALF_WIDTH) * base_r;
+        let right = center + Vec2::from_angle(angle + HALF_WIDTH) * base_r;
+        let tip = center + Vec2::from_angle(angle) * (base_r + len);
+        let color = Color::new(1.0, (140.0 + 60.0 * flicker) / 255.0, 40.0 / 255.0, 0.8 * intensity);
+        draw_triangle(left, right, tip, color);
+    }
+}
+
 fn draw_burst(center: Vec2, note_radius: f32, kind: NoteKind, judge: Judge, t: f32) {
     let strong = judge == Judge::Ryo;
     let fade = 1.0 - t;
@@ -202,6 +262,28 @@ mod tests {
             _ => None,
         }).collect();
         assert_eq!(texts, vec![Judge::Fuka]);
+    }
+
+    fn assert_near(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 1e-4, "expected {expected}, got {actual}");
+    }
+
+    #[test]
+    fn gogo_intensity_fades_in_and_out() {
+        let ranges = [(2.0, 4.0)];
+        assert_near(gogo_intensity(1.9, &ranges), 0.0);
+        assert_near(gogo_intensity(2.0, &ranges), 0.0);
+        assert_near(gogo_intensity(2.0 + GOGO_FADE_SEC / 2.0, &ranges), 0.5);
+        assert_near(gogo_intensity(3.0, &ranges), 1.0);
+        assert_near(gogo_intensity(4.0 + GOGO_FADE_SEC / 2.0, &ranges), 0.5);
+        assert_near(gogo_intensity(5.0, &ranges), 0.0);
+        assert_near(gogo_intensity(3.0, &[]), 0.0);
+    }
+
+    #[test]
+    fn contiguous_gogo_ranges_do_not_dip() {
+        let ranges = [(4.0, 6.0), (2.0, 4.0)];
+        assert_near(gogo_intensity(4.0 + GOGO_FADE_SEC / 2.0, &ranges), 1.0);
     }
 
     #[test]
