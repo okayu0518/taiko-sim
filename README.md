@@ -138,7 +138,7 @@ cargo run
 - `.tja` パーサ:
   - 難易度選択: `Oni` 優先（なければ `Hard` -> `Normal` -> `Easy`）
   - 対応: `TITLE`, `WAVE`, `BPM`, `OFFSET`, `COURSE`, `LEVEL`
-  - コマンド対応: `#BPMCHANGE`, `#SCROLL`, `#MEASURE`, `#DELAY`（`#BPMCHANGE` / `#SCROLL` / `#DELAY` は小節途中でも可）
+  - コマンド対応: `#BPMCHANGE`, `#SCROLL`, `#MEASURE`, `#DELAY`, `#GOGOSTART`, `#GOGOEND`（`#MEASURE` 以外は小節途中でも可）
   - 譜面分岐: `#BRANCHSTART`（`r` 連打数 / `p` 精度 / `s` スコア）, `#N`, `#E`, `#M`, `#BRANCHEND`, `#SECTION`, `#LEVELHOLD`
 - スクロール: ノーツごとの `BPM × SCROLL` に比例した速さで流れる（`#SCROLL 1` で 1 拍 = 240px）
 - 譜面分岐の判定: 分岐の 1 小節前の小節線で、前回の判定（または `#SECTION`）以降の成績から決定
@@ -148,6 +148,7 @@ cargo run
   - スコア: 良 `300` / 可 `150` / 不可 `0`、不可でコンボが切れる
 - ヒットエフェクト: 入力時のレーン発光、ヒットバースト、ノーツが飛ぶ演出、判定文字
 - スコア/コンボ/リザルト表示
+- ゴーゴータイム: ノーツ・連打の得点が 1.2 倍。判定枠に区間が来るとレーンがオレンジになり、判定枠の周りに炎を表示
 - 連打ノーツ: `5/6/7/9` 開始、`8` 終了をパースして描画/加点
 - タイミング補正: `timing_offset_ms` を保存して再起動後も維持
 - 連打中は判定枠上に連打数を表示
