@@ -278,7 +278,7 @@ impl TaikoSimApp {
         let offset = self.timing_offset_sec();
         let Some(session) = self.session.as_mut() else { return; };
         let missed = session.update(now, offset);
-        let finished = session.is_finished(now);
+        let finished = session.is_finished(now, offset);
         if missed > 0 { self.effects.spawn_judge_text(now, Judge::Fuka); }
         if finished { self.to_result(); }
     }

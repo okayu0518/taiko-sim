@@ -111,8 +111,9 @@ impl PlaySession {
         branch.map_or(true, |b| b == self.branch_at(chart_sec))
     }
 
-    pub fn is_finished(&self, now: f64) -> bool {
-        now > self.chart.duration_sec + 1.0
+    /// Whether play is over: one second after the chart end, in game time.
+    pub fn is_finished(&self, now: f64, timing_offset_sec: f64) -> bool {
+        now > self.game_time(self.chart.duration_sec + 1.0, timing_offset_sec)
     }
 
     /// Process branch judgements and section resets reached by `now`.
@@ -404,8 +405,18 @@ mod tests {
     #[test]
     fn session_finishes_one_second_after_duration() {
         let s = session_with_notes(vec![]);
-        assert!(!s.is_finished(6.0));
-        assert!(s.is_finished(6.01));
+        assert!(!s.is_finished(6.0, 0.0));
+        assert!(s.is_finished(6.01, 0.0));
+    }
+
+    #[test]
+    fn finish_time_accounts_for_chart_and_timing_offsets() {
+        let mut s = session_with_notes(vec![]);
+        s.chart.offset_sec = -5.0;
+        assert!(!s.is_finished(11.0, 0.0));
+        assert!(s.is_finished(11.01, 0.0));
+        assert!(!s.is_finished(11.1, 0.1));
+        assert!(s.is_finished(11.11, 0.1));
     }
 
     // --- rolls ---
