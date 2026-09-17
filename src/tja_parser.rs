@@ -405,19 +405,282 @@ fn clean_line(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    fn parse(src: &str, preferred: Option<&str>) -> Chart {
+        parse_tja_text(src, preferred).expect("parse failed").0
+    }
+
+    /// Parse a single Oni course at BPM 120 (one 4/4 measure = 2.0s).
+    fn parse_body(body: &str) -> Chart {
+        parse(&format!("BPM:120\nCOURSE:Oni\n#START\n{body}\n#END\n"), None)
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-9, "expected {expected}, got {actual}");
+    }
+
+    fn note_times(chart: &Chart) -> Vec<f64> {
+        chart.notes.iter().map(|n| n.time_sec).collect()
+    }
+
+    fn assert_times(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len(), "times: {actual:?}");
+        for (a, e) in actual.iter().zip(expected) {
+            assert_close(*a, *e);
+        }
+    }
+
+    // --- headers / course selection ---
+
+    #[test]
+    fn headers_are_parsed() {
+        let src = "TITLE:Sample\nBPM:150\nWAVE:sample.ogg\nOFFSET:-1.5\n\nCOURSE:Oni\nLEVEL:7\n#START\n1,\n#END\n";
+        let (chart, wave) = parse_tja_text(src, None).unwrap();
+        assert_eq!(chart.title, "Sample");
+        assert_eq!(chart.course, "Oni");
+        assert_eq!(chart.level, 7);
+        assert_close(chart.offset_sec, -1.5);
+        assert_eq!(wave.as_deref(), Some("sample.ogg"));
+    }
+
+    #[test]
+    fn missing_headers_use_defaults() {
+        let chart = parse("#START\n1,1,\n#END\n", None);
+        assert_eq!(chart.title, "Unknown");
+        assert_eq!(chart.course, "Unknown");
+        assert_eq!(chart.level, 0);
+        assert_close(chart.offset_sec, 0.0);
+        // Default BPM 120 -> 2.0s per measure.
+        assert_times(&note_times(&chart), &[0.0, 2.0]);
+    }
+
+    #[test]
+    fn missing_start_block_is_error() {
+        assert!(parse_tja_text("TITLE:x\nBPM:120\n1,\n", None).is_err());
+    }
+
+    #[test]
+    fn non_positive_bpm_is_error() {
+        assert!(parse_tja_text("BPM:0\n#START\n1,\n#END\n", None).is_err());
+    }
+
+    const MULTI_COURSE: &str = "BPM:120\n\
+        COURSE:Easy\nLEVEL:2\n#START\n1,\n#END\n\
+        COURSE:Hard\nLEVEL:5\n#START\n1,\n#END\n\
+        COURSE:Oni\nLEVEL:9\n#START\n1,\n#END\n";
+
+    #[test]
+    fn preferred_course_is_selected_case_insensitively() {
+        let chart = parse(MULTI_COURSE, Some("hard"));
+        assert_eq!(chart.course, "Hard");
+        assert_eq!(chart.level, 5);
+    }
+
+    #[test]
+    fn course_priority_is_used_without_preference() {
+        assert_eq!(parse(MULTI_COURSE, None).course, "Oni");
+        let src = "COURSE:Easy\n#START\n1,\n#END\nCOURSE:Normal\n#START\n1,\n#END\n";
+        assert_eq!(parse(src, None).course, "Normal");
+    }
+
+    #[test]
+    fn missing_preferred_course_falls_back_to_priority() {
+        assert_eq!(parse(MULTI_COURSE, Some("Edit")).course, "Oni");
+    }
+
+    #[test]
+    fn unknown_courses_fall_back_to_first_block() {
+        let src = "COURSE:Edit\nLEVEL:10\n#START\n1,\n#END\nCOURSE:Tower\n#START\n1,\n#END\n";
+        assert_eq!(parse(src, None).course, "Edit");
+    }
+
+    #[test]
+    fn course_headers_are_inherited_by_later_courses() {
+        let src = "COURSE:Oni\nLEVEL:9\n#START\n1,\n#END\nCOURSE:Hard\n#START\n1,\n#END\n";
+        assert_eq!(parse(src, Some("Hard")).level, 9);
+    }
+
+    #[test]
+    fn global_headers_apply_to_every_course() {
+        let src = "TITLE:Song\nCOURSE:Easy\n#START\n1,\n#END\nCOURSE:Oni\n#START\n1,\n#END\n";
+        assert_eq!(parse(src, Some("Easy")).title, "Song");
+        assert_eq!(parse(src, Some("Oni")).title, "Song");
+    }
+
+    // --- text handling ---
+
+    #[test]
+    fn comments_are_stripped() {
+        let src = "TITLE:Song // comment\n// full line comment\n#START\n1020, // trailing\n#END\n";
+        let chart = parse(src, None);
+        assert_eq!(chart.title, "Song");
+        assert_eq!(chart.notes.len(), 2);
+    }
+
+    #[test]
+    fn crlf_line_endings_are_supported() {
+        let chart = parse("BPM:120\r\n#START\r\n1,\r\n1,\r\n#END\r\n", None);
+        assert_times(&note_times(&chart), &[0.0, 2.0]);
+    }
+
+    #[test]
+    fn utf8_bom_is_stripped() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice("TITLE:太鼓".as_bytes());
+        assert_eq!(decode_tja_bytes(bytes), "TITLE:太鼓");
+    }
+
+    #[test]
+    fn shift_jis_is_decoded() {
+        let (bytes, _, _) = SHIFT_JIS.encode("TITLE:太鼓の達人");
+        assert!(std::str::from_utf8(&bytes).is_err());
+        assert_eq!(decode_tja_bytes(bytes.into_owned()), "TITLE:太鼓の達人");
+    }
+
+    // --- note timing ---
+
+    #[test]
+    fn notes_are_spaced_by_measure_division() {
+        let chart = parse_body("1020,\n10002000,");
+        let kinds: Vec<_> = chart.notes.iter().map(|n| n.kind).collect();
+        assert_eq!(kinds, vec![NoteKind::Don, NoteKind::Kat, NoteKind::Don, NoteKind::Kat]);
+        assert_times(&note_times(&chart), &[0.0, 1.0, 2.0, 3.0]);
+        assert_close(chart.duration_sec, 4.0 + 2.0);
+    }
+
+    #[test]
+    fn empty_measure_advances_time() {
+        let chart = parse_body("1,\n,\n1,");
+        assert_times(&note_times(&chart), &[0.0, 4.0]);
+    }
+
+    #[test]
+    fn measure_can_span_multiple_lines() {
+        let chart = parse_body("10\n20,");
+        assert_times(&note_times(&chart), &[0.0, 1.0]);
+    }
+
+    #[test]
+    fn trailing_measure_without_comma_is_parsed() {
+        let chart = parse_body("1,\n11");
+        assert_times(&note_times(&chart), &[0.0, 2.0, 3.0]);
+    }
+
     #[test]
     fn big_notes_are_flagged() {
-        let mut notes = Vec::new();
-        let mut rolls = Vec::new();
-        let mut open_rolls = Vec::new();
-        consume_measure("1234", &mut notes, &mut rolls, &mut open_rolls, 0.0, 120.0, 1.0, 4, 4, None);
-
-        let kinds: Vec<_> = notes.iter().map(|n| (n.kind, n.big)).collect();
+        let chart = parse_body("1234,");
+        let kinds: Vec<_> = chart.notes.iter().map(|n| (n.kind, n.big)).collect();
         assert_eq!(kinds, vec![
             (NoteKind::Don, false),
             (NoteKind::Kat, false),
             (NoteKind::Don, true),
             (NoteKind::Kat, true),
         ]);
+    }
+
+    #[test]
+    fn bpm_change_affects_following_measures() {
+        let chart = parse_body("1,\n#BPMCHANGE 240\n1,\n1,");
+        assert_times(&note_times(&chart), &[0.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    #[ignore = "known limitation: commands inside a measure apply to the whole measure"]
+    fn bpm_change_inside_measure_affects_only_following_notes() {
+        // First half at BPM 120 (1.0s), second half at BPM 240 (0.5s).
+        let chart = parse_body("10\n#BPMCHANGE 240\n10,\n1,");
+        assert_times(&note_times(&chart), &[0.0, 1.0, 1.5]);
+    }
+
+    #[test]
+    fn measure_change_scales_measure_length() {
+        let chart = parse_body("#MEASURE 3/4\n1,\n1,\n#MEASURE 4/4\n1,\n1,");
+        assert_times(&note_times(&chart), &[0.0, 1.5, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn delay_shifts_following_notes() {
+        let chart = parse_body("1,\n#DELAY 0.5\n1,");
+        assert_times(&note_times(&chart), &[0.0, 2.5]);
+    }
+
+    #[test]
+    fn scroll_applies_to_following_notes() {
+        let chart = parse_body("1,\n#SCROLL 1.5\n1,");
+        let scrolls: Vec<_> = chart.notes.iter().map(|n| n.scroll_speed).collect();
+        assert_eq!(scrolls, vec![1.0, 1.5]);
+    }
+
+    // --- rolls ---
+
+    #[test]
+    fn rolls_are_parsed_with_kind() {
+        let chart = parse_body("5000,8000,\n6008,\n7080,\n98,");
+        assert!(chart.notes.is_empty());
+        let rolls: Vec<_> = chart.rolls.iter().map(|r| (r.start_sec, r.end_sec, r.big, r.balloon)).collect();
+        assert_eq!(rolls, vec![
+            (0.0, 2.0, false, false),
+            (4.0, 5.5, true, false),
+            (6.0, 7.0, true, true),
+            (8.0, 9.0, true, true),
+        ]);
+    }
+
+    #[test]
+    fn unclosed_roll_ends_at_chart_end() {
+        let chart = parse_body("5000,0000,");
+        assert_eq!(chart.rolls.len(), 1);
+        assert_close(chart.rolls[0].start_sec, 0.0);
+        assert_close(chart.rolls[0].end_sec, 4.0);
+    }
+
+    #[test]
+    fn stray_roll_end_is_ignored() {
+        let chart = parse_body("8010,");
+        assert!(chart.rolls.is_empty());
+        assert_eq!(chart.notes.len(), 1);
+    }
+
+    // --- branches ---
+
+    #[test]
+    fn branches_rewind_time_and_merge_at_longest() {
+        let chart = parse_body(
+            "1,\n#BRANCHSTART p,80,90\n#N\n1,\n#E\n2,\n#M\n1,1,\n#BRANCHEND\n2,",
+        );
+        assert!(chart.has_branch);
+
+        let notes: Vec<_> = chart.notes.iter().map(|n| (n.time_sec, n.kind, n.branch)).collect();
+        assert_eq!(notes, vec![
+            (0.0, NoteKind::Don, None),
+            (2.0, NoteKind::Don, Some(Branch::Normal)),
+            (2.0, NoteKind::Kat, Some(Branch::Expert)),
+            (2.0, NoteKind::Don, Some(Branch::Master)),
+            (4.0, NoteKind::Don, Some(Branch::Master)),
+            // Merges after the longest branch.
+            (6.0, NoteKind::Kat, None),
+        ]);
+
+        assert_eq!(chart.branch_points.len(), 1);
+        let bp = &chart.branch_points[0];
+        assert_close(bp.time_sec, 2.0);
+        assert_eq!(bp.requirement_type, 'p');
+        assert_close(bp.expert_threshold, 80.0);
+        assert_close(bp.master_threshold, 90.0);
+    }
+
+    #[test]
+    fn roll_branch_and_section_points_are_recorded() {
+        let chart = parse_body("1,\n#SECTION\n#BRANCHSTART r, 5, 10\n#N\n1,\n#E\n1,\n#M\n1,\n#BRANCHEND");
+        let points: Vec<_> = chart.branch_points.iter()
+            .map(|bp| (bp.time_sec, bp.requirement_type, bp.expert_threshold, bp.master_threshold))
+            .collect();
+        assert_eq!(points, vec![(2.0, 's', 0.0, 0.0), (2.0, 'r', 5.0, 10.0)]);
+    }
+
+    #[test]
+    fn rolls_keep_their_branch() {
+        let chart = parse_body("#BRANCHSTART r,1,2\n#N\n5008,\n#E\n0,\n#M\n0,\n#BRANCHEND");
+        assert_eq!(chart.rolls.len(), 1);
+        assert_eq!(chart.rolls[0].branch, Some(Branch::Normal));
     }
 }
