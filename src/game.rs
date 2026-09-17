@@ -10,6 +10,7 @@ use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 
 use crate::models::{AppConfig, Branch, BranchPoint, Chart, KeybindConfig, NoteKind, Roll, ScoreState, SongEntry};
 
+use crate::effects::{note_color, Effects};
 use crate::judge::{is_passed, judge_hit, Judge, WINDOW_KA};
 use crate::repository::load_song_entries;
 use crate::tja_parser::parse_tja;
@@ -160,6 +161,7 @@ pub struct TaikoSimApp {
     sink: Option<Sink>,
     ui_font: Option<Font>,
     roll_hit_count: i32,
+    effects: Effects,
     se_don: Option<SeData>,
     se_ka: Option<SeData>,
     se_latency_stats: Arc<SeLatencyStats>,
@@ -203,6 +205,7 @@ impl TaikoSimApp {
             sink: None,
             ui_font: None,
             roll_hit_count: 0,
+            effects: Effects::default(),
             se_don: None,
             se_ka: None,
             se_latency_stats,
@@ -268,12 +271,16 @@ impl TaikoSimApp {
         let now = self.current_time_sec();
         self.check_branch_points(now);
 
+        self.effects.update(now);
+
         if self.keybinds.don_pressed() {
             self.play_key_se(NoteKind::Don);
+            self.effects.spawn_input(now, NoteKind::Don);
             self.try_hit(NoteKind::Don);
         }
         if self.keybinds.kat_pressed() {
             self.play_key_se(NoteKind::Kat);
+            self.effects.spawn_input(now, NoteKind::Kat);
             self.try_hit(NoteKind::Kat);
         }
         if is_key_pressed(KeyCode::LeftBracket) { self.adjust_timing_offset(-5); }
@@ -306,6 +313,7 @@ impl TaikoSimApp {
         }
 
         for _ in 0..miss_count { self.register_judge(Judge::Fuka); }
+        if miss_count > 0 { self.effects.spawn_judge_text(now, Judge::Fuka); }
     }
 
     fn check_branch_points(&mut self, now: f64) {
@@ -405,6 +413,7 @@ impl TaikoSimApp {
         self.chart = Some(chart);
         self.score = ScoreState::default();
         self.roll_hit_count = 0;
+        self.effects.clear();
         self.start_time_sec = get_time();
         self.sink = Some(sink);
         self.current_branch = Branch::Normal;
@@ -430,6 +439,7 @@ impl TaikoSimApp {
         note.judged = true;
         note.hit = true;
         self.register_judge(judge);
+        self.effects.spawn_hit(now, input_kind, judge);
     }
 
     fn find_nearest_note(&self, now: f64, window: f64, kind: NoteKind) -> Option<(usize, f64)> {
@@ -519,11 +529,14 @@ impl TaikoSimApp {
         let cam = Camera2D { zoom: vec2(2.0 / BASE_W, -2.0 / BASE_H), target: vec2(BASE_W / 2.0, BASE_H / 2.0), ..Default::default() };
         set_camera(&cam);
 
-        draw_rectangle(LANE_X, LANE_Y - (LANE_H * 0.5), LANE_W, LANE_H, Color::from_rgba(39, 45, 56, 255));
+        let lane_rect = Rect::new(LANE_X, LANE_Y - (LANE_H * 0.5), LANE_W, LANE_H);
+        let target = vec2(TARGET_X, LANE_Y);
+        let now = self.current_time_sec();
+        draw_rectangle(lane_rect.x, lane_rect.y, lane_rect.w, lane_rect.h, Color::from_rgba(39, 45, 56, 255));
+        self.effects.draw_under_notes(now, lane_rect);
         draw_circle(TARGET_X, LANE_Y, JUDGE_RING_RADIUS, Color::from_rgba(255, 245, 180, 30));
         draw_circle_lines(TARGET_X, LANE_Y, JUDGE_RING_RADIUS, 3.0, Color::from_rgba(255, 230, 140, 255));
 
-        let now = self.current_time_sec();
         let cur_branch = self.current_branch;
         self.draw_rolls(chart, now, cur_branch);
         for note in &chart.notes {
@@ -535,12 +548,13 @@ impl TaikoSimApp {
             if !(-SCROLL_BEHIND_SEC..=SCROLL_AHEAD_SEC).contains(&diff) { continue; }
 
             let x = TARGET_X + ((diff / SCROLL_AHEAD_SEC) as f32) * SCROLL_PIXELS * (note.scroll_speed as f32);
-            let color = if note.kind == NoteKind::Don { Color::from_rgba(255, 120, 100, 255) } else { Color::from_rgba(100, 180, 255, 255) };
-            draw_circle(x, LANE_Y, NOTE_RADIUS, color);
+            draw_circle(x, LANE_Y, NOTE_RADIUS, note_color(note.kind));
             draw_circle_lines(x, LANE_Y, NOTE_RADIUS, 2.0, BLACK);
         }
+        self.effects.draw_over_notes(now, target, NOTE_RADIUS);
 
         set_default_camera();
+        self.effects.draw_texts(now, target, |text, x, y, size, color| self.draw_ui_text(text, x, y, size, color));
 
         let branch_name = if chart.has_branch { format!(" [{:?}]", cur_branch) } else { "".to_string() };
         self.draw_ui_text(&format!("{} [{} Lv{}]{}", chart.title, chart.course, chart.level, branch_name), 40.0, 56.0, 40, WHITE);
