@@ -382,11 +382,11 @@ impl TaikoSimApp {
         draw_circle(TARGET_X, LANE_Y, JUDGE_RING_RADIUS, Color::from_rgba(255, 245, 180, 30));
         draw_circle_lines(TARGET_X, LANE_Y, JUDGE_RING_RADIUS, 3.0, Color::from_rgba(255, 230, 140, 255));
 
-        let cur_branch = session.current_branch;
+        let cur_branch = session.current_branch();
         self.draw_rolls(session, now);
         for note in &chart.notes {
             if note.judged && note.hit { continue; }
-            if !session.is_on_current_branch(note.branch) { continue; }
+            if !session.is_active(note.branch, note.time_sec) { continue; }
 
             let diff = session.game_time(note.time_sec, offset) - now;
             if diff < -SCROLL_BEHIND_SEC { continue; }
@@ -432,7 +432,7 @@ impl TaikoSimApp {
     fn draw_rolls(&self, session: &PlaySession, now: f64) {
         let offset = self.timing_offset_sec();
         for roll in &session.chart.rolls {
-            if !session.is_on_current_branch(roll.branch) { continue; }
+            if !session.is_active(roll.branch, roll.start_sec) { continue; }
             let start_diff = session.game_time(roll.start_sec, offset) - now;
             let end_diff = session.game_time(roll.end_sec, offset) - now;
             if end_diff < -SCROLL_BEHIND_SEC { continue; }

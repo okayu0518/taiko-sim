@@ -58,10 +58,25 @@ pub struct Roll {
     pub tail_speed: ScrollSpeed,
 }
 
-#[derive(Clone)]
+/// Requirement type of `#BRANCHSTART`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BranchCondition {
+    /// `r`: roll hit count.
+    Roll,
+    /// `p`: accuracy in percent.
+    Precision,
+    /// `s`: score.
+    Score,
+}
+
+#[derive(Clone, PartialEq, Debug)]
 pub struct BranchPoint {
-    pub time_sec: f64,
-    pub requirement_type: char, // 'r' for roll, 'p' for precision
+    /// Chart time the branch is decided: the bar line one measure before the branch.
+    pub judge_time_sec: f64,
+    /// Chart time the branched section starts.
+    pub start_time_sec: f64,
+    /// `None` when the requirement could not be parsed; the branch then becomes Normal.
+    pub condition: Option<BranchCondition>,
     pub expert_threshold: f64,
     pub master_threshold: f64,
 }
@@ -75,6 +90,8 @@ pub struct Chart {
     pub notes: Vec<Note>,
     pub rolls: Vec<Roll>,
     pub branch_points: Vec<BranchPoint>,
+    /// Chart times of `#SECTION` (branch stats reset).
+    pub section_resets: Vec<f64>,
     pub has_branch: bool,
     pub duration_sec: f64,
 }

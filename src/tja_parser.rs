@@ -3,7 +3,7 @@ use std::path::Path;
 
 use encoding_rs::{SHIFT_JIS, UTF_8};
 
-use crate::models::{Branch, BranchPoint, Chart, Note, NoteKind, Roll, ScrollSpeed};
+use crate::models::{Branch, BranchCondition, BranchPoint, Chart, Note, NoteKind, Roll, ScrollSpeed};
 
 const COURSE_PRIORITY: [&str; 4] = ["oni", "hard", "normal", "easy"];
 
@@ -175,6 +175,7 @@ fn build_chart(
     let mut notes = Vec::new();
     let mut rolls = Vec::new();
     let mut branch_points = Vec::new();
+    let mut section_resets = Vec::new();
     let mut has_branch = false;
     let mut current_branch: Option<Branch> = None;
     let mut branch_start_time: Option<f64> = None;
@@ -184,6 +185,8 @@ fn build_chart(
     let mut measure_num = 4_i32;
     let mut measure_den = 4_i32;
     let mut measure_items: Vec<MeasureItem> = Vec::new();
+    // Length of the last completed measure, used to place branch judgements.
+    let mut last_measure_sec = 0.0_f64;
 
     for line in body_lines {
         if line.starts_with('#') {
@@ -207,22 +210,14 @@ fn build_chart(
                     }
                 }
             } else if cmd_upper.starts_with("BRANCHSTART") {
+                // A new branch without #BRANCHEND first merges the previous one.
+                if branch_start_time.is_some() {
+                    timing.time = max_branch_time.max(timing.time);
+                }
                 has_branch = true;
                 branch_start_time = Some(timing.time);
                 max_branch_time = timing.time;
-                let args = cmd[11..].trim();
-                let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
-                if parts.len() >= 3 {
-                    let req_type = parts[0].chars().next().unwrap_or('p');
-                    let expert_threshold = parts[1].parse::<f64>().unwrap_or(0.0);
-                    let master_threshold = parts[2].parse::<f64>().unwrap_or(0.0);
-                    branch_points.push(BranchPoint {
-                        time_sec: timing.time,
-                        requirement_type: req_type,
-                        expert_threshold,
-                        master_threshold,
-                    });
-                }
+                branch_points.push(parse_branch_start(&cmd[11..], timing.time, last_measure_sec));
             } else if let Some(branch) = match cmd_upper.as_str() {
                 "N" => Some(Branch::Normal),
                 "E" => Some(Branch::Expert),
@@ -242,18 +237,14 @@ fn build_chart(
                 }
                 current_branch = None;
             } else if cmd_upper == "SECTION" {
-                branch_points.push(BranchPoint {
-                    time_sec: timing.time,
-                    requirement_type: 's', // section reset
-                    expert_threshold: 0.0,
-                    master_threshold: 0.0,
-                });
+                section_resets.push(timing.time);
             }
             continue;
         }
 
         for ch in line.chars() {
             if ch == ',' {
+                let measure_start = timing.time;
                 consume_measure(
                     &measure_items,
                     &mut timing,
@@ -264,6 +255,7 @@ fn build_chart(
                     measure_den,
                     current_branch,
                 );
+                last_measure_sec = timing.time - measure_start;
                 measure_items.clear();
             } else if ch.is_ascii_digit() {
                 measure_items.push(MeasureItem::Note(ch));
@@ -297,9 +289,35 @@ fn build_chart(
         notes,
         rolls,
         branch_points,
+        section_resets,
         has_branch,
         duration_sec,
     })
+}
+
+/// Parse `#BRANCHSTART` arguments (`type, expert, master`).
+///
+/// The branch is judged at the bar line one measure before `start_time_sec`.
+fn parse_branch_start(args: &str, start_time_sec: f64, previous_measure_sec: f64) -> BranchPoint {
+    let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
+    let threshold = |i: usize| parts.get(i).and_then(|v| v.parse::<f64>().ok());
+    let condition = match parts.first().and_then(|p| p.chars().next()).map(|c| c.to_ascii_lowercase()) {
+        Some('r') => Some(BranchCondition::Roll),
+        Some('p') => Some(BranchCondition::Precision),
+        Some('s') => Some(BranchCondition::Score),
+        _ => None,
+    };
+    let (condition, expert_threshold, master_threshold) = match (condition, threshold(1), threshold(2)) {
+        (Some(c), Some(e), Some(m)) => (Some(c), e, m),
+        _ => (None, 0.0, 0.0),
+    };
+    BranchPoint {
+        judge_time_sec: (start_time_sec - previous_measure_sec).max(0.0),
+        start_time_sec,
+        condition,
+        expert_threshold,
+        master_threshold,
+    }
 }
 
 /// Current position and scroll state while reading a chart.
@@ -727,6 +745,10 @@ mod tests {
 
     // --- branches ---
 
+    fn branch_point(judge: f64, start: f64, condition: Option<BranchCondition>, expert: f64, master: f64) -> BranchPoint {
+        BranchPoint { judge_time_sec: judge, start_time_sec: start, condition, expert_threshold: expert, master_threshold: master }
+    }
+
     #[test]
     fn branches_rewind_time_and_merge_at_longest() {
         let chart = parse_body(
@@ -745,21 +767,62 @@ mod tests {
             (6.0, NoteKind::Kat, None),
         ]);
 
-        assert_eq!(chart.branch_points.len(), 1);
-        let bp = &chart.branch_points[0];
-        assert_close(bp.time_sec, 2.0);
-        assert_eq!(bp.requirement_type, 'p');
-        assert_close(bp.expert_threshold, 80.0);
-        assert_close(bp.master_threshold, 90.0);
+        assert_eq!(chart.branch_points, vec![
+            branch_point(0.0, 2.0, Some(BranchCondition::Precision), 80.0, 90.0),
+        ]);
     }
 
     #[test]
-    fn roll_branch_and_section_points_are_recorded() {
-        let chart = parse_body("1,\n#SECTION\n#BRANCHSTART r, 5, 10\n#N\n1,\n#E\n1,\n#M\n1,\n#BRANCHEND");
-        let points: Vec<_> = chart.branch_points.iter()
-            .map(|bp| (bp.time_sec, bp.requirement_type, bp.expert_threshold, bp.master_threshold))
+    fn branch_is_judged_one_measure_before_start() {
+        let chart = parse_body("1,\n#MEASURE 3/4\n1,\n#BRANCHSTART r,5,10\n#N\n1,\n#E\n1,\n#M\n1,\n#BRANCHEND");
+        // Previous measure is 3/4 (1.5s) starting at 2.0.
+        assert_eq!(chart.branch_points, vec![
+            branch_point(2.0, 3.5, Some(BranchCondition::Roll), 5.0, 10.0),
+        ]);
+    }
+
+    #[test]
+    fn branch_at_chart_start_is_judged_immediately() {
+        let chart = parse_body("#BRANCHSTART p,1,2\n#N\n1,\n#E\n1,\n#M\n1,\n#BRANCHEND");
+        assert_close(chart.branch_points[0].judge_time_sec, 0.0);
+        assert_close(chart.branch_points[0].start_time_sec, 0.0);
+    }
+
+    #[test]
+    fn branch_conditions_are_parsed() {
+        let chart = parse_body(
+            "1,\n#BRANCHSTART s, 1000, 2000\n#N\n1,\n#BRANCHEND\n\
+             #BRANCHSTART x,1,2\n#N\n1,\n#BRANCHEND\n\
+             #BRANCHSTART p\n#N\n1,\n#BRANCHEND",
+        );
+        let conditions: Vec<_> = chart.branch_points.iter()
+            .map(|bp| (bp.condition, bp.expert_threshold, bp.master_threshold))
             .collect();
-        assert_eq!(points, vec![(2.0, 's', 0.0, 0.0), (2.0, 'r', 5.0, 10.0)]);
+        assert_eq!(conditions, vec![
+            (Some(BranchCondition::Score), 1000.0, 2000.0),
+            (None, 0.0, 0.0),
+            (None, 0.0, 0.0),
+        ]);
+    }
+
+    #[test]
+    fn section_resets_are_recorded() {
+        let chart = parse_body("1,\n#SECTION\n#BRANCHSTART r, 5, 10\n#N\n1,\n#E\n1,\n#M\n1,\n#BRANCHEND\n1,\n#SECTION\n1,");
+        assert_eq!(chart.section_resets, vec![2.0, 6.0]);
+        assert_eq!(chart.branch_points.len(), 1);
+    }
+
+    #[test]
+    fn consecutive_branch_starts_merge_previous_branch() {
+        // No #BRANCHEND between the branches; #N is longer than #M.
+        let chart = parse_body(
+            "1,\n#BRANCHSTART r,1,2\n#N\n1,1,\n#E\n1,\n#M\n1,\n\
+             #BRANCHSTART r,1,2\n#N\n2,\n#E\n2,\n#M\n2,\n#BRANCHEND",
+        );
+        let starts: Vec<_> = chart.branch_points.iter().map(|bp| bp.start_time_sec).collect();
+        assert_eq!(starts, vec![2.0, 6.0]);
+        let kat_times: Vec<_> = chart.notes.iter().filter(|n| n.kind == NoteKind::Kat).map(|n| n.time_sec).collect();
+        assert_eq!(kat_times, vec![6.0, 6.0, 6.0]);
     }
 
     #[test]

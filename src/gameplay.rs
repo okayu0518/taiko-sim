@@ -1,15 +1,19 @@
 use crate::judge::{is_passed, judge_hit, Judge, WINDOW_KA};
-use crate::models::{Branch, BranchPoint, Chart, NoteKind, Roll, ScoreState};
+use crate::models::{Branch, BranchCondition, BranchPoint, Chart, NoteKind, Roll, ScoreState};
 
 pub const ROLL_HIT_SCORE: i32 = 30;
 
-/// Judgement counts since the last branch point.
+/// Tolerance when comparing chart times produced by the parser.
+const TIME_EPS: f64 = 1e-9;
+
+/// Judgement counts since the last branch judgement or `#SECTION`.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SectionStats {
     pub perfect: i32,
     pub good: i32,
     pub miss: i32,
     pub rolls: i32,
+    pub score: i32,
 }
 
 impl SectionStats {
@@ -34,6 +38,15 @@ pub enum HitOutcome {
     Ignored,
 }
 
+/// Branch-related events in chart time order.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BranchEvent {
+    /// Decide the branch for `chart.branch_points[i]`.
+    Judge(usize),
+    /// `#SECTION`: reset the section stats.
+    SectionReset,
+}
+
 /// Gameplay state for one play of a chart, independent of rendering, audio and input.
 ///
 /// All `now` arguments are game time in seconds since the song started, and
@@ -41,21 +54,32 @@ pub enum HitOutcome {
 pub struct PlaySession {
     pub chart: Chart,
     pub score: ScoreState,
-    pub current_branch: Branch,
     pub section: SectionStats,
     pub roll_hit_count: i32,
-    branch_points_handled: usize,
+    /// Branch chosen for each branch point decided so far (same order as `chart.branch_points`).
+    decided_branches: Vec<Branch>,
+    /// Branch events sorted by chart time.
+    branch_events: Vec<(f64, BranchEvent)>,
+    next_branch_event: usize,
 }
 
 impl PlaySession {
     pub fn new(chart: Chart) -> Self {
+        let mut branch_events: Vec<_> = chart.branch_points.iter().enumerate()
+            .map(|(i, bp)| (bp.judge_time_sec, BranchEvent::Judge(i)))
+            .chain(chart.section_resets.iter().map(|&t| (t, BranchEvent::SectionReset)))
+            .collect();
+        // Stable sort keeps judgements before resets at the same time.
+        branch_events.sort_by(|a, b| a.0.total_cmp(&b.0));
+
         Self {
             chart,
             score: ScoreState::default(),
-            current_branch: Branch::Normal,
             section: SectionStats::default(),
             roll_hit_count: 0,
-            branch_points_handled: 0,
+            decided_branches: Vec::new(),
+            branch_events,
+            next_branch_event: 0,
         }
     }
 
@@ -64,44 +88,59 @@ impl PlaySession {
         chart_sec - self.chart.offset_sec + timing_offset_sec
     }
 
-    /// Whether an object on `branch` is playable on the current branch.
-    pub fn is_on_current_branch(&self, branch: Option<Branch>) -> bool {
-        branch.map_or(true, |b| b == self.current_branch)
+    /// The most recently decided branch (shown in the HUD).
+    pub fn current_branch(&self) -> Branch {
+        self.decided_branches.last().copied().unwrap_or(Branch::Normal)
+    }
+
+    /// Branch played at `chart_sec`. Sections not decided yet follow the current branch.
+    pub fn branch_at(&self, chart_sec: f64) -> Branch {
+        self.chart.branch_points.iter()
+            .rposition(|bp| bp.start_time_sec <= chart_sec + TIME_EPS)
+            .map_or(Branch::Normal, |i| self.decided_branches.get(i).copied().unwrap_or(self.current_branch()))
+    }
+
+    /// Whether an object on `branch` at `chart_sec` belongs to the branch being played.
+    pub fn is_active(&self, branch: Option<Branch>, chart_sec: f64) -> bool {
+        branch.map_or(true, |b| b == self.branch_at(chart_sec))
     }
 
     pub fn is_finished(&self, now: f64) -> bool {
         now > self.chart.duration_sec + 1.0
     }
 
-    /// Evaluate every branch point reached by `now`.
+    /// Process branch judgements and section resets reached by `now`.
     pub fn check_branch_points(&mut self, now: f64, timing_offset_sec: f64) {
-        while let Some(bp) = self.chart.branch_points.get(self.branch_points_handled) {
-            if now < self.game_time(bp.time_sec, timing_offset_sec) {
+        while let Some(&(time, event)) = self.branch_events.get(self.next_branch_event) {
+            if now < self.game_time(time, timing_offset_sec) {
                 return;
             }
-            let bp = bp.clone();
-            self.evaluate_branch(&bp);
-            self.branch_points_handled += 1;
+            match event {
+                BranchEvent::Judge(i) => {
+                    let branch = self.evaluate_branch(&self.chart.branch_points[i]);
+                    self.decided_branches.push(branch);
+                    self.section = SectionStats::default();
+                }
+                BranchEvent::SectionReset => self.section = SectionStats::default(),
+            }
+            self.next_branch_event += 1;
         }
     }
 
-    fn evaluate_branch(&mut self, bp: &BranchPoint) {
-        let value = match bp.requirement_type {
-            'r' => Some(self.section.rolls as f64),
-            'p' => Some(self.section.accuracy()),
-            // 's' (section reset) and unknown types only reset the stats.
-            _ => None,
+    fn evaluate_branch(&self, bp: &BranchPoint) -> Branch {
+        let value = match bp.condition {
+            Some(BranchCondition::Roll) => self.section.rolls as f64,
+            Some(BranchCondition::Precision) => self.section.accuracy(),
+            Some(BranchCondition::Score) => self.section.score as f64,
+            None => return Branch::Normal,
         };
-        if let Some(v) = value {
-            self.current_branch = if v >= bp.master_threshold {
-                Branch::Master
-            } else if v >= bp.expert_threshold {
-                Branch::Expert
-            } else {
-                Branch::Normal
-            };
+        if value >= bp.master_threshold {
+            Branch::Master
+        } else if value >= bp.expert_threshold {
+            Branch::Expert
+        } else {
+            Branch::Normal
         }
-        self.section = SectionStats::default();
     }
 
     /// Handle a drum input. Rolls take priority over notes; wrong-color or
@@ -132,15 +171,14 @@ impl PlaySession {
             self.roll_hit_count = 0;
         }
 
-        let offset = self.chart.offset_sec;
-        let cur_branch = self.current_branch;
         let mut missed = 0;
-        for note in &mut self.chart.notes {
-            if note.judged || note.branch.is_some_and(|b| b != cur_branch) {
+        for idx in 0..self.chart.notes.len() {
+            let note = &self.chart.notes[idx];
+            if note.judged || !self.is_active(note.branch, note.time_sec) {
                 continue;
             }
-            let note_time = note.time_sec - offset + timing_offset_sec;
-            if is_passed(now - note_time) {
+            if is_passed(now - self.game_time(note.time_sec, timing_offset_sec)) {
+                let note = &mut self.chart.notes[idx];
                 note.judged = true;
                 note.hit = false;
                 missed += 1;
@@ -153,18 +191,20 @@ impl PlaySession {
     }
 
     pub fn active_roll(&self, now: f64, timing_offset_sec: f64) -> Option<&Roll> {
-        self.chart.rolls.iter().find(|r| {
-            self.is_on_current_branch(r.branch)
-                && now >= self.game_time(r.start_sec, timing_offset_sec)
-                && now <= self.game_time(r.end_sec, timing_offset_sec)
-        })
+        self.chart.rolls.iter().find(|r| self.is_roll_active_at(r, now, timing_offset_sec))
+    }
+
+    fn is_roll_active_at(&self, roll: &Roll, now: f64, timing_offset_sec: f64) -> bool {
+        self.is_active(roll.branch, roll.start_sec)
+            && now >= self.game_time(roll.start_sec, timing_offset_sec)
+            && now <= self.game_time(roll.end_sec, timing_offset_sec)
     }
 
     fn find_nearest_note(&self, now: f64, timing_offset_sec: f64, kind: NoteKind) -> Option<(usize, f64)> {
         let mut best = None;
         let mut best_abs = f64::MAX;
         for (idx, note) in self.chart.notes.iter().enumerate() {
-            if note.judged || note.kind != kind || !self.is_on_current_branch(note.branch) {
+            if note.judged || note.kind != kind || !self.is_active(note.branch, note.time_sec) {
                 continue;
             }
             let abs_delta = (now - self.game_time(note.time_sec, timing_offset_sec)).abs();
@@ -179,21 +219,20 @@ impl PlaySession {
     fn hit_roll_if_active(&mut self, now: f64, timing_offset_sec: f64, kind: NoteKind) -> bool {
         // Balloons only accept Don; a Kat input falls through to the next roll or notes.
         let accepted = self.chart.rolls.iter().any(|roll| {
-            self.is_on_current_branch(roll.branch)
-                && now >= self.game_time(roll.start_sec, timing_offset_sec)
-                && now <= self.game_time(roll.end_sec, timing_offset_sec)
-                && (!roll.balloon || kind == NoteKind::Don)
+            self.is_roll_active_at(roll, now, timing_offset_sec) && (!roll.balloon || kind == NoteKind::Don)
         });
         if accepted {
             self.score.score += ROLL_HIT_SCORE;
             self.roll_hit_count += 1;
             self.section.rolls += 1;
+            self.section.score += ROLL_HIT_SCORE;
         }
         accepted
     }
 
     fn register_judge(&mut self, judge: Judge) {
         self.score.score += judge.score();
+        self.section.score += judge.score();
         match judge {
             Judge::Ryo => { self.score.perfect += 1; self.section.perfect += 1; }
             Judge::Ka => { self.score.good += 1; self.section.good += 1; }
@@ -219,10 +258,6 @@ mod tests {
         Roll { start_sec, end_sec, big: false, balloon, branch: None, head_speed: SPEED, tail_speed: SPEED }
     }
 
-    fn branch_point(time_sec: f64, requirement_type: char, expert: f64, master: f64) -> BranchPoint {
-        BranchPoint { time_sec, requirement_type, expert_threshold: expert, master_threshold: master }
-    }
-
     fn chart(notes: Vec<Note>, rolls: Vec<Roll>, branch_points: Vec<BranchPoint>) -> Chart {
         Chart {
             title: "test".to_string(),
@@ -233,6 +268,7 @@ mod tests {
             notes,
             rolls,
             branch_points,
+            section_resets: vec![],
             duration_sec: 5.0,
         }
     }
@@ -403,17 +439,25 @@ mod tests {
         assert!((actual - expected).abs() < 1e-9, "expected {expected}, got {actual}");
     }
 
+    fn branch_point(judge_time_sec: f64, start_time_sec: f64, condition: BranchCondition, expert: f64, master: f64) -> BranchPoint {
+        BranchPoint { judge_time_sec, start_time_sec, condition: Some(condition), expert_threshold: expert, master_threshold: master }
+    }
+
+    fn branched_note(time_sec: f64, branch: Branch) -> Note {
+        Note { branch: Some(branch), ..note(time_sec, NoteKind::Don) }
+    }
+
+    fn session_with_branches(notes: Vec<Note>, branch_points: Vec<BranchPoint>, section_resets: Vec<f64>) -> PlaySession {
+        let mut c = chart(notes, vec![], branch_points);
+        c.section_resets = section_resets;
+        PlaySession::new(c)
+    }
+
     #[test]
     fn section_accuracy_weights_ka_half() {
         assert_close(SectionStats::default().accuracy(), 0.0);
-        let stats = SectionStats { perfect: 2, good: 1, miss: 1, rolls: 0 };
+        let stats = SectionStats { perfect: 2, good: 1, miss: 1, ..Default::default() };
         assert_close(stats.accuracy(), 62.5);
-    }
-
-    fn session_with_section(bp: BranchPoint, section: SectionStats) -> PlaySession {
-        let mut s = PlaySession::new(chart(vec![], vec![], vec![bp]));
-        s.section = section;
-        s
     }
 
     #[test]
@@ -421,10 +465,10 @@ mod tests {
         let cases = [(0, Branch::Normal), (1, Branch::Expert), (3, Branch::Master)];
         // perfect / (perfect + 1 miss): 0% / 50% / 75%
         for (perfect, expected) in cases {
-            let section = SectionStats { perfect, miss: 1, ..Default::default() };
-            let mut s = session_with_section(branch_point(2.0, 'p', 50.0, 75.0), section);
+            let mut s = session_with_branches(vec![], vec![branch_point(2.0, 4.0, BranchCondition::Precision, 50.0, 75.0)], vec![]);
+            s.section = SectionStats { perfect, miss: 1, ..Default::default() };
             s.check_branch_points(2.0, 0.0);
-            assert_eq!(s.current_branch, expected, "perfect = {perfect}");
+            assert_eq!(s.current_branch(), expected, "perfect = {perfect}");
             assert_eq!(s.section, SectionStats::default());
         }
     }
@@ -433,68 +477,152 @@ mod tests {
     fn roll_branch_uses_roll_count() {
         let cases = [(4, Branch::Normal), (5, Branch::Expert), (10, Branch::Master)];
         for (rolls, expected) in cases {
-            let section = SectionStats { rolls, ..Default::default() };
-            let mut s = session_with_section(branch_point(2.0, 'r', 5.0, 10.0), section);
+            let mut s = session_with_branches(vec![], vec![branch_point(2.0, 4.0, BranchCondition::Roll, 5.0, 10.0)], vec![]);
+            s.section.rolls = rolls;
             s.check_branch_points(2.0, 0.0);
-            assert_eq!(s.current_branch, expected, "rolls = {rolls}");
+            assert_eq!(s.current_branch(), expected, "rolls = {rolls}");
         }
     }
 
     #[test]
-    fn branch_points_wait_for_their_time_and_offset() {
-        let section = SectionStats { rolls: 10, ..Default::default() };
-        let mut s = session_with_section(branch_point(2.0, 'r', 5.0, 10.0), section);
-        s.check_branch_points(2.05, 0.1);
-        assert_eq!(s.current_branch, Branch::Normal);
-        assert_eq!(s.section.rolls, 10);
-
-        s.check_branch_points(2.1, 0.1);
-        assert_eq!(s.current_branch, Branch::Master);
+    fn score_branch_uses_section_score() {
+        let mut s = session_with_branches(
+            vec![note(0.5, NoteKind::Don), note(1.0, NoteKind::Don)],
+            vec![branch_point(2.0, 4.0, BranchCondition::Score, 500.0, 600.0)],
+            vec![],
+        );
+        s.hit(0.5, 0.0, NoteKind::Don);
+        s.hit(1.05, 0.0, NoteKind::Don);
+        assert_eq!(s.section.score, 450);
+        s.check_branch_points(2.0, 0.0);
+        assert_eq!(s.current_branch(), Branch::Normal);
     }
 
     #[test]
-    fn section_point_resets_stats_without_changing_branch() {
-        let mut s = PlaySession::new(chart(vec![], vec![], vec![
-            branch_point(1.0, 'r', 1.0, 2.0),
-            branch_point(2.0, 's', 0.0, 0.0),
-            branch_point(3.0, 'r', 1.0, 2.0),
-        ]));
+    fn unparsed_condition_selects_normal() {
+        let mut bp = branch_point(2.0, 4.0, BranchCondition::Roll, 0.0, 0.0);
+        bp.condition = None;
+        let mut s = session_with_branches(vec![], vec![bp], vec![]);
+        s.check_branch_points(2.0, 0.0);
+        assert_eq!(s.current_branch(), Branch::Normal);
+    }
+
+    #[test]
+    fn branch_is_decided_at_judge_time_with_offset() {
+        let mut s = session_with_branches(vec![], vec![branch_point(2.0, 4.0, BranchCondition::Roll, 5.0, 10.0)], vec![]);
+        s.section.rolls = 10;
+        s.check_branch_points(2.05, 0.1);
+        assert_eq!(s.current_branch(), Branch::Normal);
+        assert_eq!(s.section.rolls, 10);
+
+        s.check_branch_points(2.1, 0.1);
+        assert_eq!(s.current_branch(), Branch::Master);
+    }
+
+    #[test]
+    fn upcoming_branch_notes_become_active_at_judge_time() {
+        let mut s = session_with_branches(
+            vec![branched_note(4.0, Branch::Normal), branched_note(4.0, Branch::Master)],
+            vec![branch_point(2.0, 4.0, BranchCondition::Roll, 1.0, 2.0)],
+            vec![],
+        );
+        // Before the judgement, upcoming notes follow the current branch.
+        assert!(s.is_active(Some(Branch::Normal), 4.0));
+        assert!(!s.is_active(Some(Branch::Master), 4.0));
+
+        s.section.rolls = 5;
+        s.check_branch_points(2.0, 0.0);
+        assert!(!s.is_active(Some(Branch::Normal), 4.0));
+        assert!(s.is_active(Some(Branch::Master), 4.0));
+        assert!(matches!(s.hit(4.0, 0.0, NoteKind::Don), HitOutcome::Note { .. }));
+        assert!(s.chart.notes[1].judged && !s.chart.notes[0].judged);
+    }
+
+    #[test]
+    fn switching_branch_does_not_miss_past_notes_of_new_branch() {
+        let mut s = session_with_branches(
+            vec![
+                // Section 1 (4.0..8.0), played on Normal.
+                branched_note(4.0, Branch::Normal),
+                branched_note(4.0, Branch::Master),
+                // Section 2 (10.0..), played on Master.
+                branched_note(10.0, Branch::Normal),
+                branched_note(10.0, Branch::Master),
+            ],
+            vec![
+                branch_point(2.0, 4.0, BranchCondition::Roll, 1.0, 2.0),
+                branch_point(8.0, 10.0, BranchCondition::Roll, 1.0, 2.0),
+            ],
+            vec![],
+        );
+        s.check_branch_points(2.0, 0.0);
+        s.hit(4.0, 0.0, NoteKind::Don);
+
+        s.section.rolls = 5;
+        s.check_branch_points(8.0, 0.0);
+        assert_eq!(s.current_branch(), Branch::Master);
+        assert_eq!(s.branch_at(4.0), Branch::Normal);
+        assert_eq!(s.branch_at(10.0), Branch::Master);
+
+        assert_eq!(s.update(9.0, 0.0), 0);
+        assert_eq!(s.score.miss, 0);
+        assert!(!s.chart.notes[1].judged);
+
+        assert_eq!(s.update(11.0, 0.0), 1);
+        assert!(s.chart.notes[3].judged && !s.chart.notes[2].judged);
+    }
+
+    #[test]
+    fn section_reset_clears_stats_without_changing_branch() {
+        let mut s = session_with_branches(
+            vec![],
+            vec![
+                branch_point(1.0, 1.5, BranchCondition::Roll, 1.0, 2.0),
+                branch_point(3.0, 3.5, BranchCondition::Roll, 1.0, 2.0),
+            ],
+            vec![2.0],
+        );
         s.section.rolls = 5;
         s.check_branch_points(1.0, 0.0);
-        assert_eq!(s.current_branch, Branch::Master);
+        assert_eq!(s.current_branch(), Branch::Master);
 
         s.section.rolls = 5;
         s.check_branch_points(2.5, 0.0);
-        assert_eq!(s.current_branch, Branch::Master);
+        assert_eq!(s.current_branch(), Branch::Master);
         assert_eq!(s.section.rolls, 0);
 
         // Nothing hit since the section reset.
         s.check_branch_points(3.0, 0.0);
-        assert_eq!(s.current_branch, Branch::Normal);
+        assert_eq!(s.current_branch(), Branch::Normal);
     }
 
     #[test]
-    fn multiple_passed_branch_points_are_evaluated_in_order() {
-        let mut s = PlaySession::new(chart(vec![], vec![], vec![
-            branch_point(1.0, 'r', 1.0, 2.0),
-            branch_point(2.0, 'r', 1.0, 2.0),
-        ]));
+    fn multiple_passed_events_are_processed_in_time_order() {
+        // Section reset listed separately but occurs before the second judgement.
+        let mut s = session_with_branches(
+            vec![],
+            vec![
+                branch_point(1.0, 2.0, BranchCondition::Roll, 1.0, 2.0),
+                branch_point(3.0, 4.0, BranchCondition::Roll, 1.0, 2.0),
+            ],
+            vec![0.5],
+        );
         s.section.rolls = 5;
         s.check_branch_points(10.0, 0.0);
-        // The second point sees the stats reset by the first.
-        assert_eq!(s.current_branch, Branch::Normal);
+        // The reset at 0.5 cleared the stats before the first judgement.
+        assert_eq!(s.decided_branches, vec![Branch::Normal, Branch::Normal]);
     }
 
     #[test]
     fn judgements_feed_branch_evaluation() {
-        let mut s = PlaySession::new(chart(
+        let mut s = session_with_branches(
             vec![note(0.5, NoteKind::Don), note(1.0, NoteKind::Don)],
+            vec![branch_point(2.0, 4.0, BranchCondition::Precision, 50.0, 90.0)],
             vec![],
-            vec![branch_point(2.0, 'p', 50.0, 90.0)],
-        ));
+        );
         s.hit(0.5, 0.0, NoteKind::Don);
         s.update(1.5, 0.0);
         s.check_branch_points(2.0, 0.0);
-        assert_eq!(s.current_branch, Branch::Expert);
+        assert_eq!(s.current_branch(), Branch::Expert);
     }
 }
