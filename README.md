@@ -136,7 +136,10 @@ cargo run
 - `.tja` パーサ:
   - 難易度選択: `Oni` 優先（なければ `Hard` -> `Normal` -> `Easy`）
   - 対応: `TITLE`, `WAVE`, `BPM`, `OFFSET`, `COURSE`, `LEVEL`
-  - コマンド対応: `#BPMCHANGE`, `#MEASURE`, `#DELAY`
+  - コマンド対応: `#BPMCHANGE`, `#SCROLL`, `#MEASURE`, `#DELAY`（`#BPMCHANGE` / `#SCROLL` / `#DELAY` は小節途中でも可）
+  - 譜面分岐: `#BRANCHSTART`（`r` 連打数 / `p` 精度 / `s` スコア）, `#N`, `#E`, `#M`, `#BRANCHEND`, `#SECTION`, `#LEVELHOLD`
+- スクロール: ノーツごとの `BPM × SCROLL` に比例した速さで流れる（`#SCROLL 1` で 1 拍 = 240px）
+- 譜面分岐の判定: 分岐の 1 小節前の小節線で、前回の判定（または `#SECTION`）以降の成績から決定
 - 判定: 良 `±25ms` / 可 `±75ms` / 不可（おに相当で固定、大音符も通常ノーツと同じ扱い）
   - 可の範囲を過ぎて叩かれなかったノーツは不可
   - 色違いの入力や判定範囲外の入力は無視（ノーツは消費しない）
@@ -154,7 +157,6 @@ cargo run
 ```bash
 cargo test                 # all unit tests
 cargo test gameplay        # filter by module/test name
-cargo test -- --ignored    # known limitations (expected to fail)
 ```
 
 - テストは各モジュール内の `#[cfg(test)] mod tests` にあります。`data/` には依存しません。
@@ -164,7 +166,7 @@ cargo test -- --ignored    # known limitations (expected to fail)
   - `repository.rs`: 曲フォルダ走査・`index.json`（一時ディレクトリを使用）
   - `effects.rs`: エフェクトの寿命管理
 - ゲーム進行ロジックは描画・音声・入力から独立した `PlaySession`（`src/gameplay.rs`）にあります。判定や分岐を変更する場合はここにテストを追加してください。
-- `#[ignore]` 付きのテストは既知の未対応仕様です（例: 小節途中の `#BPMCHANGE`）。
+- 未対応仕様をテストで残す場合は `#[ignore = "理由"]` を付け、`cargo test -- --ignored` で確認できるようにしてください。
 
 ### CI
 
