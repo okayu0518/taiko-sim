@@ -64,7 +64,7 @@ pub struct Chart {
     pub duration_sec: f64,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
 pub struct ScoreState {
     pub score: i32,
     pub combo: i32,

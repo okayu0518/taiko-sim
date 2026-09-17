@@ -203,3 +203,296 @@ impl PlaySession {
         self.score.max_combo = self.score.max_combo.max(self.score.combo);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Note;
+
+    fn note(time_sec: f64, kind: NoteKind) -> Note {
+        Note { time_sec, kind, judged: false, hit: false, big: false, branch: None, scroll_speed: 1.0 }
+    }
+
+    fn roll(start_sec: f64, end_sec: f64, balloon: bool) -> Roll {
+        Roll { start_sec, end_sec, big: false, balloon, branch: None, scroll_speed: 1.0 }
+    }
+
+    fn branch_point(time_sec: f64, requirement_type: char, expert: f64, master: f64) -> BranchPoint {
+        BranchPoint { time_sec, requirement_type, expert_threshold: expert, master_threshold: master }
+    }
+
+    fn chart(notes: Vec<Note>, rolls: Vec<Roll>, branch_points: Vec<BranchPoint>) -> Chart {
+        Chart {
+            title: "test".to_string(),
+            course: "Oni".to_string(),
+            level: 1,
+            offset_sec: 0.0,
+            has_branch: !branch_points.is_empty(),
+            notes,
+            rolls,
+            branch_points,
+            duration_sec: 5.0,
+        }
+    }
+
+    fn session_with_notes(notes: Vec<Note>) -> PlaySession {
+        PlaySession::new(chart(notes, vec![], vec![]))
+    }
+
+    // --- hits ---
+
+    #[test]
+    fn ryo_hit_scores_and_extends_combo() {
+        let mut s = session_with_notes(vec![note(1.0, NoteKind::Don)]);
+        assert_eq!(s.hit(1.01, 0.0, NoteKind::Don), HitOutcome::Note { judge: Judge::Ryo, big: false });
+        assert!(s.chart.notes[0].judged && s.chart.notes[0].hit);
+        assert_eq!((s.score.score, s.score.combo, s.score.perfect), (300, 1, 1));
+        assert_eq!(s.section.perfect, 1);
+    }
+
+    #[test]
+    fn ka_hit_scores_half() {
+        let mut s = session_with_notes(vec![note(1.0, NoteKind::Kat)]);
+        assert_eq!(s.hit(0.95, 0.0, NoteKind::Kat), HitOutcome::Note { judge: Judge::Ka, big: false });
+        assert_eq!((s.score.score, s.score.combo, s.score.good), (150, 1, 1));
+    }
+
+    #[test]
+    fn big_note_hit_reports_big() {
+        let mut big = note(1.0, NoteKind::Don);
+        big.big = true;
+        let mut s = session_with_notes(vec![big]);
+        assert_eq!(s.hit(1.0, 0.0, NoteKind::Don), HitOutcome::Note { judge: Judge::Ryo, big: true });
+    }
+
+    #[test]
+    fn wrong_color_input_is_ignored() {
+        let mut s = session_with_notes(vec![note(1.0, NoteKind::Don)]);
+        assert_eq!(s.hit(1.0, 0.0, NoteKind::Kat), HitOutcome::Ignored);
+        assert!(!s.chart.notes[0].judged);
+        assert_eq!(s.score, ScoreState::default());
+    }
+
+    #[test]
+    fn out_of_window_input_is_ignored() {
+        let mut s = session_with_notes(vec![note(1.0, NoteKind::Don)]);
+        assert_eq!(s.hit(0.9, 0.0, NoteKind::Don), HitOutcome::Ignored);
+        assert_eq!(s.hit(1.1, 0.0, NoteKind::Don), HitOutcome::Ignored);
+        assert!(!s.chart.notes[0].judged);
+    }
+
+    #[test]
+    fn nearest_matching_note_is_hit() {
+        let mut s = session_with_notes(vec![
+            note(1.0, NoteKind::Don),
+            note(1.05, NoteKind::Kat),
+            note(1.06, NoteKind::Don),
+        ]);
+        assert!(matches!(s.hit(1.04, 0.0, NoteKind::Don), HitOutcome::Note { .. }));
+        let judged: Vec<_> = s.chart.notes.iter().map(|n| n.judged).collect();
+        assert_eq!(judged, vec![false, false, true]);
+    }
+
+    #[test]
+    fn note_cannot_be_hit_twice() {
+        let mut s = session_with_notes(vec![note(1.0, NoteKind::Don)]);
+        assert!(matches!(s.hit(1.0, 0.0, NoteKind::Don), HitOutcome::Note { .. }));
+        assert_eq!(s.hit(1.0, 0.0, NoteKind::Don), HitOutcome::Ignored);
+        assert_eq!(s.score.score, 300);
+    }
+
+    #[test]
+    fn timing_offsets_shift_note_times() {
+        let mut s = session_with_notes(vec![note(1.0, NoteKind::Don), note(2.0, NoteKind::Don)]);
+        // User timing offset delays notes.
+        assert_eq!(s.hit(1.0, 0.1, NoteKind::Don), HitOutcome::Ignored);
+        assert!(matches!(s.hit(1.1, 0.1, NoteKind::Don), HitOutcome::Note { judge: Judge::Ryo, .. }));
+
+        // Negative chart OFFSET delays notes as well.
+        s.chart.offset_sec = -0.5;
+        assert_close(s.game_time(2.0, 0.0), 2.5);
+        assert!(matches!(s.hit(2.5, 0.0, NoteKind::Don), HitOutcome::Note { judge: Judge::Ryo, .. }));
+    }
+
+    // --- misses ---
+
+    #[test]
+    fn passed_notes_become_fuka_once() {
+        let mut s = session_with_notes(vec![note(1.0, NoteKind::Don), note(2.0, NoteKind::Don)]);
+        s.hit(1.0, 0.0, NoteKind::Don);
+        assert_eq!(s.score.combo, 1);
+
+        assert_eq!(s.update(2.07, 0.0), 0);
+        assert_eq!(s.update(2.1, 0.0), 1);
+        assert!(s.chart.notes[1].judged && !s.chart.notes[1].hit);
+        assert_eq!((s.score.miss, s.score.combo, s.score.max_combo), (1, 0, 1));
+        assert_eq!(s.section.miss, 1);
+
+        assert_eq!(s.update(3.0, 0.0), 0);
+        assert_eq!(s.score.miss, 1);
+    }
+
+    #[test]
+    fn notes_on_other_branches_are_ignored() {
+        let mut expert = note(1.0, NoteKind::Don);
+        expert.branch = Some(Branch::Expert);
+        let mut normal = note(1.0, NoteKind::Kat);
+        normal.branch = Some(Branch::Normal);
+        let mut s = session_with_notes(vec![expert, normal]);
+
+        assert_eq!(s.hit(1.0, 0.0, NoteKind::Don), HitOutcome::Ignored);
+        assert_eq!(s.update(5.0, 0.0), 1);
+        assert!(!s.chart.notes[0].judged);
+    }
+
+    #[test]
+    fn session_finishes_one_second_after_duration() {
+        let s = session_with_notes(vec![]);
+        assert!(!s.is_finished(6.0));
+        assert!(s.is_finished(6.01));
+    }
+
+    // --- rolls ---
+
+    #[test]
+    fn roll_hits_take_priority_over_notes() {
+        let mut s = PlaySession::new(chart(vec![note(1.5, NoteKind::Don)], vec![roll(1.0, 2.0, false)], vec![]));
+        assert_eq!(s.hit(1.5, 0.0, NoteKind::Kat), HitOutcome::Roll);
+        assert_eq!(s.hit(1.5, 0.0, NoteKind::Don), HitOutcome::Roll);
+        assert!(!s.chart.notes[0].judged);
+        assert_eq!((s.score.score, s.roll_hit_count, s.section.rolls), (2 * ROLL_HIT_SCORE, 2, 2));
+        assert_eq!(s.score.combo, 0);
+    }
+
+    #[test]
+    fn roll_counter_resets_after_roll_ends() {
+        let mut s = PlaySession::new(chart(vec![], vec![roll(1.0, 2.0, false)], vec![]));
+        s.hit(1.5, 0.0, NoteKind::Don);
+        s.update(2.0, 0.0);
+        assert_eq!(s.roll_hit_count, 1);
+        assert!(s.active_roll(2.0, 0.0).is_some());
+
+        s.update(2.01, 0.0);
+        assert_eq!(s.roll_hit_count, 0);
+        assert!(s.active_roll(2.01, 0.0).is_none());
+    }
+
+    #[test]
+    fn balloon_accepts_only_don() {
+        let mut s = PlaySession::new(chart(vec![note(1.5, NoteKind::Kat)], vec![roll(1.0, 2.0, true)], vec![]));
+        assert_eq!(s.hit(1.5, 0.0, NoteKind::Don), HitOutcome::Roll);
+        // Kat falls through to notes.
+        assert!(matches!(s.hit(1.5, 0.0, NoteKind::Kat), HitOutcome::Note { judge: Judge::Ryo, .. }));
+        assert_eq!(s.roll_hit_count, 1);
+    }
+
+    #[test]
+    fn rolls_on_other_branches_are_ignored() {
+        let mut r = roll(1.0, 2.0, false);
+        r.branch = Some(Branch::Master);
+        let mut s = PlaySession::new(chart(vec![], vec![r], vec![]));
+        assert_eq!(s.hit(1.5, 0.0, NoteKind::Don), HitOutcome::Ignored);
+        assert!(s.active_roll(1.5, 0.0).is_none());
+    }
+
+    // --- branches ---
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-9, "expected {expected}, got {actual}");
+    }
+
+    #[test]
+    fn section_accuracy_weights_ka_half() {
+        assert_close(SectionStats::default().accuracy(), 0.0);
+        let stats = SectionStats { perfect: 2, good: 1, miss: 1, rolls: 0 };
+        assert_close(stats.accuracy(), 62.5);
+    }
+
+    fn session_with_section(bp: BranchPoint, section: SectionStats) -> PlaySession {
+        let mut s = PlaySession::new(chart(vec![], vec![], vec![bp]));
+        s.section = section;
+        s
+    }
+
+    #[test]
+    fn precision_branch_uses_thresholds_inclusively() {
+        let cases = [(0, Branch::Normal), (1, Branch::Expert), (3, Branch::Master)];
+        // perfect / (perfect + 1 miss): 0% / 50% / 75%
+        for (perfect, expected) in cases {
+            let section = SectionStats { perfect, miss: 1, ..Default::default() };
+            let mut s = session_with_section(branch_point(2.0, 'p', 50.0, 75.0), section);
+            s.check_branch_points(2.0, 0.0);
+            assert_eq!(s.current_branch, expected, "perfect = {perfect}");
+            assert_eq!(s.section, SectionStats::default());
+        }
+    }
+
+    #[test]
+    fn roll_branch_uses_roll_count() {
+        let cases = [(4, Branch::Normal), (5, Branch::Expert), (10, Branch::Master)];
+        for (rolls, expected) in cases {
+            let section = SectionStats { rolls, ..Default::default() };
+            let mut s = session_with_section(branch_point(2.0, 'r', 5.0, 10.0), section);
+            s.check_branch_points(2.0, 0.0);
+            assert_eq!(s.current_branch, expected, "rolls = {rolls}");
+        }
+    }
+
+    #[test]
+    fn branch_points_wait_for_their_time_and_offset() {
+        let section = SectionStats { rolls: 10, ..Default::default() };
+        let mut s = session_with_section(branch_point(2.0, 'r', 5.0, 10.0), section);
+        s.check_branch_points(2.05, 0.1);
+        assert_eq!(s.current_branch, Branch::Normal);
+        assert_eq!(s.section.rolls, 10);
+
+        s.check_branch_points(2.1, 0.1);
+        assert_eq!(s.current_branch, Branch::Master);
+    }
+
+    #[test]
+    fn section_point_resets_stats_without_changing_branch() {
+        let mut s = PlaySession::new(chart(vec![], vec![], vec![
+            branch_point(1.0, 'r', 1.0, 2.0),
+            branch_point(2.0, 's', 0.0, 0.0),
+            branch_point(3.0, 'r', 1.0, 2.0),
+        ]));
+        s.section.rolls = 5;
+        s.check_branch_points(1.0, 0.0);
+        assert_eq!(s.current_branch, Branch::Master);
+
+        s.section.rolls = 5;
+        s.check_branch_points(2.5, 0.0);
+        assert_eq!(s.current_branch, Branch::Master);
+        assert_eq!(s.section.rolls, 0);
+
+        // Nothing hit since the section reset.
+        s.check_branch_points(3.0, 0.0);
+        assert_eq!(s.current_branch, Branch::Normal);
+    }
+
+    #[test]
+    fn multiple_passed_branch_points_are_evaluated_in_order() {
+        let mut s = PlaySession::new(chart(vec![], vec![], vec![
+            branch_point(1.0, 'r', 1.0, 2.0),
+            branch_point(2.0, 'r', 1.0, 2.0),
+        ]));
+        s.section.rolls = 5;
+        s.check_branch_points(10.0, 0.0);
+        // The second point sees the stats reset by the first.
+        assert_eq!(s.current_branch, Branch::Normal);
+    }
+
+    #[test]
+    fn judgements_feed_branch_evaluation() {
+        let mut s = PlaySession::new(chart(
+            vec![note(0.5, NoteKind::Don), note(1.0, NoteKind::Don)],
+            vec![],
+            vec![branch_point(2.0, 'p', 50.0, 90.0)],
+        ));
+        s.hit(0.5, 0.0, NoteKind::Don);
+        s.update(1.5, 0.0);
+        s.check_branch_points(2.0, 0.0);
+        assert_eq!(s.current_branch, Branch::Expert);
+    }
+}
