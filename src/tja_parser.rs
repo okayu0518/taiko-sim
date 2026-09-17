@@ -3,7 +3,7 @@ use std::path::Path;
 
 use encoding_rs::{SHIFT_JIS, UTF_8};
 
-use crate::models::{Branch, BranchCondition, BranchPoint, Chart, Note, NoteKind, Roll, ScrollSpeed};
+use crate::models::{Branch, BranchCondition, BranchPoint, Chart, LevelHold, Note, NoteKind, Roll, ScrollSpeed};
 
 const COURSE_PRIORITY: [&str; 4] = ["oni", "hard", "normal", "easy"];
 
@@ -176,6 +176,7 @@ fn build_chart(
     let mut rolls = Vec::new();
     let mut branch_points = Vec::new();
     let mut section_resets = Vec::new();
+    let mut level_holds = Vec::new();
     let mut has_branch = false;
     let mut current_branch: Option<Branch> = None;
     let mut branch_start_time: Option<f64> = None;
@@ -238,6 +239,8 @@ fn build_chart(
                 current_branch = None;
             } else if cmd_upper == "SECTION" {
                 section_resets.push(timing.time);
+            } else if cmd_upper == "LEVELHOLD" {
+                level_holds.push(LevelHold { time_sec: timing.time, branch: current_branch });
             }
             continue;
         }
@@ -290,6 +293,7 @@ fn build_chart(
         rolls,
         branch_points,
         section_resets,
+        level_holds,
         has_branch,
         duration_sec,
     })
@@ -823,6 +827,15 @@ mod tests {
         assert_eq!(starts, vec![2.0, 6.0]);
         let kat_times: Vec<_> = chart.notes.iter().filter(|n| n.kind == NoteKind::Kat).map(|n| n.time_sec).collect();
         assert_eq!(kat_times, vec![6.0, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn level_holds_record_time_and_branch() {
+        let chart = parse_body("#BRANCHSTART r,1,2\n#N\n1,\n#E\n1,\n#M\n#LEVELHOLD\n1,\n#BRANCHEND\n1,\n#LEVELHOLD");
+        assert_eq!(chart.level_holds, vec![
+            LevelHold { time_sec: 0.0, branch: Some(Branch::Master) },
+            LevelHold { time_sec: 4.0, branch: None },
+        ]);
     }
 
     #[test]

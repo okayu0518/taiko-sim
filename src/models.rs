@@ -81,6 +81,14 @@ pub struct BranchPoint {
     pub master_threshold: f64,
 }
 
+/// `#LEVELHOLD`: once reached on its branch, later branch judgements keep the current branch.
+#[derive(Clone, PartialEq, Debug)]
+pub struct LevelHold {
+    pub time_sec: f64,
+    /// Branch the command was written in; `None` applies regardless of branch.
+    pub branch: Option<Branch>,
+}
+
 #[derive(Clone)]
 pub struct Chart {
     pub title: String,
@@ -92,6 +100,7 @@ pub struct Chart {
     pub branch_points: Vec<BranchPoint>,
     /// Chart times of `#SECTION` (branch stats reset).
     pub section_resets: Vec<f64>,
+    pub level_holds: Vec<LevelHold>,
     pub has_branch: bool,
     pub duration_sec: f64,
 }

@@ -45,6 +45,8 @@ enum BranchEvent {
     Judge(usize),
     /// `#SECTION`: reset the section stats.
     SectionReset,
+    /// `#LEVELHOLD`: `chart.level_holds[i]` is reached.
+    LevelHold(usize),
 }
 
 /// Gameplay state for one play of a chart, independent of rendering, audio and input.
@@ -61,6 +63,8 @@ pub struct PlaySession {
     /// Branch events sorted by chart time.
     branch_events: Vec<(f64, BranchEvent)>,
     next_branch_event: usize,
+    /// Set by `#LEVELHOLD`; later judgements keep the current branch.
+    level_held: bool,
 }
 
 impl PlaySession {
@@ -68,6 +72,7 @@ impl PlaySession {
         let mut branch_events: Vec<_> = chart.branch_points.iter().enumerate()
             .map(|(i, bp)| (bp.judge_time_sec, BranchEvent::Judge(i)))
             .chain(chart.section_resets.iter().map(|&t| (t, BranchEvent::SectionReset)))
+            .chain(chart.level_holds.iter().enumerate().map(|(i, h)| (h.time_sec, BranchEvent::LevelHold(i))))
             .collect();
         // Stable sort keeps judgements before resets at the same time.
         branch_events.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -80,6 +85,7 @@ impl PlaySession {
             decided_branches: Vec::new(),
             branch_events,
             next_branch_event: 0,
+            level_held: false,
         }
     }
 
@@ -117,11 +123,22 @@ impl PlaySession {
             }
             match event {
                 BranchEvent::Judge(i) => {
-                    let branch = self.evaluate_branch(&self.chart.branch_points[i]);
+                    let branch = if self.level_held {
+                        self.current_branch()
+                    } else {
+                        self.evaluate_branch(&self.chart.branch_points[i])
+                    };
                     self.decided_branches.push(branch);
                     self.section = SectionStats::default();
                 }
                 BranchEvent::SectionReset => self.section = SectionStats::default(),
+                BranchEvent::LevelHold(i) => {
+                    let hold = &self.chart.level_holds[i];
+                    // Only holds written in the branch being played take effect.
+                    if self.is_active(hold.branch, hold.time_sec) {
+                        self.level_held = true;
+                    }
+                }
             }
             self.next_branch_event += 1;
         }
@@ -246,7 +263,7 @@ impl PlaySession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Note, ScrollSpeed};
+    use crate::models::{LevelHold, Note, ScrollSpeed};
 
     const SPEED: ScrollSpeed = ScrollSpeed { bpm: 120.0, scroll: 1.0 };
 
@@ -269,6 +286,7 @@ mod tests {
             rolls,
             branch_points,
             section_resets: vec![],
+            level_holds: vec![],
             duration_sec: 5.0,
         }
     }
@@ -611,6 +629,42 @@ mod tests {
         s.check_branch_points(10.0, 0.0);
         // The reset at 0.5 cleared the stats before the first judgement.
         assert_eq!(s.decided_branches, vec![Branch::Normal, Branch::Normal]);
+    }
+
+    fn level_hold_session(hold_branch: Option<Branch>) -> PlaySession {
+        let mut c = chart(vec![], vec![], vec![
+            branch_point(1.0, 2.0, BranchCondition::Roll, 1.0, 2.0),
+            branch_point(5.0, 6.0, BranchCondition::Roll, 1.0, 2.0),
+        ]);
+        c.level_holds = vec![LevelHold { time_sec: 3.0, branch: hold_branch }];
+        let mut s = PlaySession::new(c);
+        s.section.rolls = 5;
+        s.check_branch_points(1.0, 0.0);
+        assert_eq!(s.current_branch(), Branch::Master);
+        s
+    }
+
+    #[test]
+    fn level_hold_on_played_branch_keeps_branch() {
+        let mut s = level_hold_session(Some(Branch::Master));
+        // Would drop to Normal without the hold.
+        s.check_branch_points(5.0, 0.0);
+        assert_eq!(s.current_branch(), Branch::Master);
+        assert_eq!(s.branch_at(6.0), Branch::Master);
+    }
+
+    #[test]
+    fn level_hold_without_branch_applies() {
+        let mut s = level_hold_session(None);
+        s.check_branch_points(5.0, 0.0);
+        assert_eq!(s.current_branch(), Branch::Master);
+    }
+
+    #[test]
+    fn level_hold_on_other_branch_is_ignored() {
+        let mut s = level_hold_session(Some(Branch::Normal));
+        s.check_branch_points(5.0, 0.0);
+        assert_eq!(s.current_branch(), Branch::Normal);
     }
 
     #[test]
