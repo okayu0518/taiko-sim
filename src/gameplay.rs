@@ -3,6 +3,11 @@ use crate::models::{Branch, BranchCondition, BranchPoint, Chart, NoteKind, Roll,
 
 pub const ROLL_HIT_SCORE: i32 = 30;
 
+/// Score with the gogo time bonus (x1.2) applied when `gogo` is set.
+pub fn gogo_score(base: i32, gogo: bool) -> i32 {
+    if gogo { base * 6 / 5 } else { base }
+}
+
 /// Tolerance when comparing chart times produced by the parser.
 const TIME_EPS: f64 = 1e-9;
 
@@ -98,6 +103,20 @@ impl PlaySession {
         chart_sec - self.chart.offset_sec + timing_offset_sec
     }
 
+    /// Convert a game time into chart time.
+    pub fn chart_time(&self, game_sec: f64, timing_offset_sec: f64) -> f64 {
+        game_sec + self.chart.offset_sec - timing_offset_sec
+    }
+
+    /// Whether `chart_sec` is inside gogo time on the branch being played.
+    pub fn is_gogo_at(&self, chart_sec: f64) -> bool {
+        self.chart.gogo_ranges.iter().any(|r| {
+            self.is_active(r.branch, r.start_sec)
+                && chart_sec >= r.start_sec - TIME_EPS
+                && chart_sec < r.end_sec - TIME_EPS
+        })
+    }
+
     /// The most recently decided branch (shown in the HUD).
     pub fn current_branch(&self) -> Branch {
         self.decided_branches.last().copied().unwrap_or(Branch::Normal)
@@ -181,8 +200,8 @@ impl PlaySession {
         let note = &mut self.chart.notes[idx];
         note.judged = true;
         note.hit = true;
-        let big = note.big;
-        self.register_judge(judge);
+        let (big, gogo) = (note.big, note.gogo);
+        self.register_judge(judge, gogo);
         HitOutcome::Note { judge, big }
     }
 
@@ -207,7 +226,7 @@ impl PlaySession {
             }
         }
         for _ in 0..missed {
-            self.register_judge(Judge::Fuka);
+            self.register_judge(Judge::Fuka, false);
         }
         missed
     }
@@ -244,17 +263,19 @@ impl PlaySession {
             self.is_roll_active_at(roll, now, timing_offset_sec) && (!roll.balloon || kind == NoteKind::Don)
         });
         if accepted {
-            self.score.score += ROLL_HIT_SCORE;
+            let score = gogo_score(ROLL_HIT_SCORE, self.is_gogo_at(self.chart_time(now, timing_offset_sec)));
+            self.score.score += score;
             self.roll_hit_count += 1;
             self.section.rolls += 1;
-            self.section.score += ROLL_HIT_SCORE;
+            self.section.score += score;
         }
         accepted
     }
 
-    fn register_judge(&mut self, judge: Judge) {
-        self.score.score += judge.score();
-        self.section.score += judge.score();
+    fn register_judge(&mut self, judge: Judge, gogo: bool) {
+        let score = gogo_score(judge.score(), gogo);
+        self.score.score += score;
+        self.section.score += score;
         match judge {
             Judge::Ryo => { self.score.perfect += 1; self.section.perfect += 1; }
             Judge::Ka => { self.score.good += 1; self.section.good += 1; }
@@ -268,7 +289,7 @@ impl PlaySession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{LevelHold, Note, ScrollSpeed};
+    use crate::models::{GogoRange, LevelHold, Note, ScrollSpeed};
 
     const SPEED: ScrollSpeed = ScrollSpeed { bpm: 120.0, scroll: 1.0 };
 
@@ -465,6 +486,75 @@ mod tests {
         let mut s = PlaySession::new(chart(vec![], vec![r], vec![]));
         assert_eq!(s.hit(1.5, 0.0, NoteKind::Don), HitOutcome::Ignored);
         assert!(s.active_roll(1.5, 0.0).is_none());
+    }
+
+    // --- gogo time ---
+
+    fn gogo_range(start_sec: f64, end_sec: f64, branch: Option<Branch>) -> GogoRange {
+        GogoRange { start_sec, end_sec, branch }
+    }
+
+    #[test]
+    fn gogo_bonus_is_twenty_percent() {
+        assert_eq!(gogo_score(300, true), 360);
+        assert_eq!(gogo_score(150, true), 180);
+        assert_eq!(gogo_score(ROLL_HIT_SCORE, true), 36);
+        assert_eq!(gogo_score(300, false), 300);
+    }
+
+    #[test]
+    fn gogo_notes_score_with_bonus() {
+        let mut s = session_with_notes(vec![
+            Note { gogo: true, ..note(1.0, NoteKind::Don) },
+            Note { gogo: true, ..note(2.0, NoteKind::Don) },
+            note(3.0, NoteKind::Don),
+        ]);
+        s.hit(1.0, 0.0, NoteKind::Don);
+        s.hit(2.05, 0.0, NoteKind::Don);
+        s.hit(3.0, 0.0, NoteKind::Don);
+        assert_eq!(s.score.score, 360 + 180 + 300);
+        assert_eq!(s.section.score, 360 + 180 + 300);
+    }
+
+    #[test]
+    fn roll_hits_in_gogo_time_score_with_bonus() {
+        let mut c = chart(vec![], vec![roll(1.0, 3.0, false)], vec![]);
+        c.gogo_ranges = vec![gogo_range(2.0, 4.0, None)];
+        let mut s = PlaySession::new(c);
+        s.hit(1.5, 0.0, NoteKind::Don);
+        assert_eq!(s.score.score, 30);
+        s.hit(2.5, 0.0, NoteKind::Don);
+        assert_eq!(s.score.score, 30 + 36);
+    }
+
+    #[test]
+    fn gogo_range_is_half_open_and_uses_offsets() {
+        let mut c = chart(vec![], vec![], vec![]);
+        c.gogo_ranges = vec![gogo_range(2.0, 4.0, None)];
+        c.offset_sec = -1.0;
+        let s = PlaySession::new(c);
+        assert!(!s.is_gogo_at(1.99));
+        assert!(s.is_gogo_at(2.0));
+        assert!(!s.is_gogo_at(4.0));
+        // Game time 3.1 with a 0.1s timing offset is chart time 2.0.
+        assert_close(s.chart_time(3.1, 0.1), 2.0);
+        assert_close(s.game_time(s.chart_time(3.1, 0.1), 0.1), 3.1);
+    }
+
+    #[test]
+    fn gogo_ranges_follow_played_branch() {
+        let mut c = chart(vec![], vec![], vec![branch_point(0.0, 2.0, BranchCondition::Roll, 1.0, 2.0)]);
+        c.gogo_ranges = vec![
+            gogo_range(2.0, 4.0, Some(Branch::Normal)),
+            gogo_range(3.0, 4.0, Some(Branch::Master)),
+        ];
+        let mut s = PlaySession::new(c);
+        assert!(s.is_gogo_at(2.5));
+
+        s.section.rolls = 5;
+        s.check_branch_points(0.0, 0.0);
+        assert!(!s.is_gogo_at(2.5));
+        assert!(s.is_gogo_at(3.5));
     }
 
     // --- branches ---
