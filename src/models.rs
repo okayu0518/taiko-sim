@@ -126,6 +126,17 @@ pub struct AppConfig {
     pub font_path: Option<String>,
     pub debug: bool,
     pub se_enabled: bool,
+    /// Silence before the song starts, in seconds.
+    pub lead_in_sec: f64,
+}
+
+impl AppConfig {
+    pub const MAX_LEAD_IN_SEC: f64 = 10.0;
+
+    /// Lead-in time clamped to `0..=MAX_LEAD_IN_SEC`.
+    pub fn lead_in_sec(&self) -> f64 {
+        self.lead_in_sec.clamp(0.0, Self::MAX_LEAD_IN_SEC)
+    }
 }
 
 impl Default for AppConfig {
@@ -139,6 +150,7 @@ impl Default for AppConfig {
             font_path: None,
             debug: false,
             se_enabled: true,
+            lead_in_sec: 3.0,
         }
     }
 }
@@ -160,5 +172,25 @@ impl Default for KeybindConfig {
             kat_left: "D".to_string(),
             kat_right: "K".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lead_in_defaults_when_missing_from_config() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"timing_offset_ms": 10}"#).unwrap();
+        assert_eq!(cfg.lead_in_sec(), 3.0);
+    }
+
+    #[test]
+    fn lead_in_is_clamped() {
+        let with = |v: f64| AppConfig { lead_in_sec: v, ..Default::default() }.lead_in_sec();
+        assert_eq!(with(-1.0), 0.0);
+        assert_eq!(with(0.0), 0.0);
+        assert_eq!(with(2.5), 2.5);
+        assert_eq!(with(60.0), AppConfig::MAX_LEAD_IN_SEC);
     }
 }

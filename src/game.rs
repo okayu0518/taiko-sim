@@ -315,14 +315,16 @@ impl TaikoSimApp {
             Ok(s) => s,
             Err(e) => { self.error_message = format!("音声再生初期化失敗: {e}"); return; }
         };
+        // Prepend silence and shift the game clock by the same amount so audio and chart stay in sync.
+        let lead_in = self.config.lead_in_sec();
         sink.set_volume(self.config.music_volume.clamp(0.0, 2.0));
-        sink.append(source);
+        sink.append(source.delay(Duration::from_secs_f64(lead_in)));
         sink.play();
 
         self.current_song = Some(song);
         self.session = Some(PlaySession::new(chart));
         self.effects.clear();
-        self.start_time_sec = get_time();
+        self.start_time_sec = get_time() + lead_in;
         self.sink = Some(sink);
         self.scene = Scene::Play;
     }

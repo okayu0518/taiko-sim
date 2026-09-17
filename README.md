@@ -96,7 +96,8 @@ cargo run
   "vsync": true,
   "font_path": "assets/fonts/NotoSansCJK-Regular.ttc",
   "debug": false,
-  "se_enabled": true
+  "se_enabled": true,
+  "lead_in_sec": 3.0
 }
 ```
 
@@ -108,6 +109,7 @@ cargo run
 - `font_path`: 使用フォントパス（省略時は同梱フォント優先）
 - `debug`: デバッグ表示（FPS/Time）
 - `se_enabled`: 入力SEのON/OFF
+- `lead_in_sec`: 曲が始まるまでの猶予（秒、0〜10）。この間にノーツが流れてくる
 
 `debug: true` のとき、プレイ画面右上に SE 遅延の簡易計測値を表示します。
 
