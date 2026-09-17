@@ -1,5 +1,6 @@
 mod effects;
 mod game;
+mod gameplay;
 mod judge;
 mod models;
 mod repository;

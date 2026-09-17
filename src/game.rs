@@ -8,16 +8,16 @@ use std::time::Instant;
 use macroquad::prelude::*;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 
-use crate::models::{AppConfig, Branch, BranchPoint, Chart, KeybindConfig, NoteKind, Roll, ScoreState, SongEntry};
+use crate::models::{AppConfig, KeybindConfig, NoteKind, ScoreState, SongEntry};
 
 use crate::effects::{note_color, Effects};
-use crate::judge::{is_passed, judge_hit, Judge, WINDOW_KA};
+use crate::gameplay::{HitOutcome, PlaySession};
+use crate::judge::Judge;
 use crate::repository::load_song_entries;
 use crate::tja_parser::parse_tja;
 
 const SCROLL_AHEAD_SEC: f64 = 2.0;
 const SCROLL_BEHIND_SEC: f64 = 0.25;
-const ROLL_HIT_SCORE: i32 = 30;
 
 const BASE_W: f32 = 1280.0;
 const BASE_H: f32 = 720.0;
@@ -154,25 +154,16 @@ pub struct TaikoSimApp {
     scene: Scene,
 
     current_song: Option<SongEntry>,
-    chart: Option<Chart>,
-    score: ScoreState,
+    session: Option<PlaySession>,
     start_time_sec: f64,
     _audio_stream: Option<OutputStream>,
     audio_handle: Option<OutputStreamHandle>,
     sink: Option<Sink>,
     ui_font: Option<Font>,
-    roll_hit_count: i32,
     effects: Effects,
     se_don: Option<SeData>,
     se_ka: Option<SeData>,
     se_latency_stats: Arc<SeLatencyStats>,
-
-    current_branch: Branch,
-    section_perfect: i32,
-    section_good: i32,
-    section_miss: i32,
-    section_rolls: i32,
-    branch_points_handled: usize,
 
     config_path: PathBuf,
     config: AppConfig,
@@ -198,24 +189,16 @@ impl TaikoSimApp {
             selected_idx: 0,
             scene: Scene::SongSelect,
             current_song: None,
-            chart: None,
-            score: ScoreState::default(),
+            session: None,
             start_time_sec: 0.0,
             _audio_stream: audio_stream,
             audio_handle,
             sink: None,
             ui_font: None,
-            roll_hit_count: 0,
             effects: Effects::default(),
             se_don: None,
             se_ka: None,
             se_latency_stats,
-            current_branch: Branch::Normal,
-            section_perfect: 0,
-            section_good: 0,
-            section_miss: 0,
-            section_rolls: 0,
-            branch_points_handled: 0,
             config_path,
             config,
             keybinds,
@@ -267,22 +250,23 @@ impl TaikoSimApp {
     }
 
     fn update_play(&mut self) {
-        if self.chart.is_none() { return; }
+        if self.session.is_none() { return; }
 
         let now = self.current_time_sec();
-        self.check_branch_points(now);
+        let offset = self.timing_offset_sec();
+        if let Some(session) = self.session.as_mut() { session.check_branch_points(now, offset); }
 
         self.effects.update(now);
 
         if self.keybinds.don_pressed() {
             self.play_key_se(NoteKind::Don);
             self.effects.spawn_input(now, NoteKind::Don);
-            self.try_hit(NoteKind::Don);
+            self.try_hit(now, NoteKind::Don);
         }
         if self.keybinds.kat_pressed() {
             self.play_key_se(NoteKind::Kat);
             self.effects.spawn_input(now, NoteKind::Kat);
-            self.try_hit(NoteKind::Kat);
+            self.try_hit(now, NoteKind::Kat);
         }
         if is_key_pressed(KeyCode::LeftBracket) { self.adjust_timing_offset(-5); }
         if is_key_pressed(KeyCode::RightBracket) { self.adjust_timing_offset(5); }
@@ -291,87 +275,12 @@ impl TaikoSimApp {
             sink.set_volume(self.config.music_volume.clamp(0.0, 2.0));
         }
 
-        if self.current_active_roll(now).is_none() {
-            self.roll_hit_count = 0;
-        }
-
-        let timing_offset_sec = self.timing_offset_sec();
-        let mut miss_count = 0;
-        let cur_branch = self.current_branch;
-        if let Some(chart) = self.chart.as_mut() {
-            for note in &mut chart.notes {
-                if note.judged { continue; }
-                if let Some(b) = note.branch { if b != cur_branch { continue; } }
-
-                let note_time = note.time_sec - chart.offset_sec + timing_offset_sec;
-                if is_passed(now - note_time) {
-                    note.judged = true;
-                    note.hit = false;
-                    miss_count += 1;
-                }
-            }
-            if now > chart.duration_sec + 1.0 { self.to_result(); }
-        }
-
-        for _ in 0..miss_count { self.register_judge(Judge::Fuka); }
-        if miss_count > 0 { self.effects.spawn_judge_text(now, Judge::Fuka); }
-    }
-
-    fn check_branch_points(&mut self, now: f64) {
-        loop {
-            let bp = {
-                let Some(chart) = self.chart.as_ref() else { return; };
-                if self.branch_points_handled >= chart.branch_points.len() {
-                    return;
-                }
-                let bp = &chart.branch_points[self.branch_points_handled];
-                let bp_time = bp.time_sec - chart.offset_sec + self.timing_offset_sec();
-                if now >= bp_time {
-                    bp.clone()
-                } else {
-                    return;
-                }
-            };
-
-            self.evaluate_branch(&bp);
-            self.branch_points_handled += 1;
-        }
-    }
-
-    fn evaluate_branch(&mut self, bp: &BranchPoint) {
-        match bp.requirement_type {
-            'r' => {
-                let rolls = self.section_rolls;
-                if rolls as f64 >= bp.master_threshold {
-                    self.current_branch = Branch::Master;
-                } else if rolls as f64 >= bp.expert_threshold {
-                    self.current_branch = Branch::Expert;
-                } else {
-                    self.current_branch = Branch::Normal;
-                }
-            }
-            'p' => {
-                let total = self.section_perfect + self.section_good + self.section_miss;
-                let accuracy = if total == 0 { 0.0 } else {
-                    (self.section_perfect as f64 + self.section_good as f64 * 0.5) / total as f64 * 100.0
-                };
-                if accuracy >= bp.master_threshold {
-                    self.current_branch = Branch::Master;
-                } else if accuracy >= bp.expert_threshold {
-                    self.current_branch = Branch::Expert;
-                } else {
-                    self.current_branch = Branch::Normal;
-                }
-            }
-            's' => {
-                // section reset
-            }
-            _ => {}
-        }
-        self.section_perfect = 0;
-        self.section_good = 0;
-        self.section_miss = 0;
-        self.section_rolls = 0;
+        let offset = self.timing_offset_sec();
+        let Some(session) = self.session.as_mut() else { return; };
+        let missed = session.update(now, offset);
+        let finished = session.is_finished(now);
+        if missed > 0 { self.effects.spawn_judge_text(now, Judge::Fuka); }
+        if finished { self.to_result(); }
     }
 
     fn update_result(&mut self) {
@@ -411,87 +320,21 @@ impl TaikoSimApp {
         sink.play();
 
         self.current_song = Some(song);
-        self.chart = Some(chart);
-        self.score = ScoreState::default();
-        self.roll_hit_count = 0;
+        self.session = Some(PlaySession::new(chart));
         self.effects.clear();
         self.start_time_sec = get_time();
         self.sink = Some(sink);
-        self.current_branch = Branch::Normal;
-        self.section_perfect = 0;
-        self.section_good = 0;
-        self.section_miss = 0;
-        self.section_rolls = 0;
-        self.branch_points_handled = 0;
         self.scene = Scene::Play;
     }
 
     fn current_time_sec(&self) -> f64 { get_time() - self.start_time_sec }
 
-    fn try_hit(&mut self, input_kind: NoteKind) {
-        let now = self.current_time_sec();
-        if self.hit_roll_if_active(now, input_kind) { return; }
-
-        // Wrong-color or out-of-window inputs are ignored, like the original game.
-        let Some((idx, delta)) = self.find_nearest_note(now, WINDOW_KA, input_kind) else { return; };
-        let Some(judge) = judge_hit(delta) else { return; };
-        let Some(chart) = self.chart.as_mut() else { return; };
-        let note = &mut chart.notes[idx];
-        note.judged = true;
-        note.hit = true;
-        let radius = note_radius(note.big);
-        self.register_judge(judge);
-        self.effects.spawn_hit(now, input_kind, judge, radius);
-    }
-
-    fn find_nearest_note(&self, now: f64, window: f64, kind: NoteKind) -> Option<(usize, f64)> {
-        let chart = self.chart.as_ref()?;
-        let mut best = None;
-        let mut best_abs = f64::MAX;
-        let cur_branch = self.current_branch;
-
-        for (idx, note) in chart.notes.iter().enumerate() {
-            if note.judged || note.kind != kind { continue; }
-            if let Some(b) = note.branch { if b != cur_branch { continue; } }
-
-            let note_time = note.time_sec - chart.offset_sec + self.timing_offset_sec();
-            let abs_delta = (now - note_time).abs();
-            if abs_delta <= window && abs_delta < best_abs {
-                best_abs = abs_delta;
-                best = Some(idx);
-            }
+    fn try_hit(&mut self, now: f64, input_kind: NoteKind) {
+        let offset = self.timing_offset_sec();
+        let Some(session) = self.session.as_mut() else { return; };
+        if let HitOutcome::Note { judge, big } = session.hit(now, offset, input_kind) {
+            self.effects.spawn_hit(now, input_kind, judge, note_radius(big));
         }
-        best.map(|i| (i, best_abs))
-    }
-
-    fn hit_roll_if_active(&mut self, now: f64, input_kind: NoteKind) -> bool {
-        let Some(chart) = self.chart.as_ref() else { return false; };
-        let cur_branch = self.current_branch;
-        for roll in &chart.rolls {
-            if let Some(b) = roll.branch { if b != cur_branch { continue; } }
-            let start = roll.start_sec - chart.offset_sec + self.timing_offset_sec();
-            let end = roll.end_sec - chart.offset_sec + self.timing_offset_sec();
-            if now < start || now > end { continue; }
-
-            if !roll.balloon || (roll.balloon && input_kind == NoteKind::Don) {
-                self.score.score += ROLL_HIT_SCORE;
-                self.roll_hit_count += 1;
-                self.section_rolls += 1;
-                return true;
-            }
-        }
-        false
-    }
-
-    fn register_judge(&mut self, judge: Judge) {
-        self.score.score += judge.score();
-        match judge {
-            Judge::Ryo => { self.score.perfect += 1; self.section_perfect += 1; }
-            Judge::Ka => { self.score.good += 1; self.section_good += 1; }
-            Judge::Fuka => { self.score.miss += 1; self.section_miss += 1; }
-        }
-        if judge.keeps_combo() { self.score.combo += 1; } else { self.score.combo = 0; }
-        self.score.max_combo = self.score.max_combo.max(self.score.combo);
     }
 
     fn to_result(&mut self) {
@@ -524,7 +367,9 @@ impl TaikoSimApp {
 
     fn draw_play(&self) {
         clear_background(Color::from_rgba(24, 26, 33, 255));
-        let Some(chart) = self.chart.as_ref() else { return; };
+        let Some(session) = self.session.as_ref() else { return; };
+        let chart = &session.chart;
+        let offset = self.timing_offset_sec();
 
         let cam = Camera2D { zoom: vec2(2.0 / BASE_W, -2.0 / BASE_H), target: vec2(BASE_W / 2.0, BASE_H / 2.0), ..Default::default() };
         set_camera(&cam);
@@ -537,14 +382,13 @@ impl TaikoSimApp {
         draw_circle(TARGET_X, LANE_Y, JUDGE_RING_RADIUS, Color::from_rgba(255, 245, 180, 30));
         draw_circle_lines(TARGET_X, LANE_Y, JUDGE_RING_RADIUS, 3.0, Color::from_rgba(255, 230, 140, 255));
 
-        let cur_branch = self.current_branch;
-        self.draw_rolls(chart, now, cur_branch);
+        let cur_branch = session.current_branch;
+        self.draw_rolls(session, now);
         for note in &chart.notes {
             if note.judged && note.hit { continue; }
-            if let Some(b) = note.branch { if b != cur_branch { continue; } }
+            if !session.is_on_current_branch(note.branch) { continue; }
 
-            let note_time = note.time_sec - chart.offset_sec + self.timing_offset_sec();
-            let diff = note_time - now;
+            let diff = session.game_time(note.time_sec, offset) - now;
             if !(-SCROLL_BEHIND_SEC..=SCROLL_AHEAD_SEC).contains(&diff) { continue; }
 
             let x = TARGET_X + ((diff / SCROLL_AHEAD_SEC) as f32) * SCROLL_PIXELS * (note.scroll_speed as f32);
@@ -559,13 +403,13 @@ impl TaikoSimApp {
 
         let branch_name = if chart.has_branch { format!(" [{:?}]", cur_branch) } else { "".to_string() };
         self.draw_ui_text(&format!("{} [{} Lv{}]{}", chart.title, chart.course, chart.level, branch_name), 40.0, 56.0, 40, WHITE);
-        self.draw_ui_text(&format!("Score: {}", self.score.score), 320.0, 570.0, 36, WHITE);
-        self.draw_ui_text(&self.score.combo.to_string(), TARGET_X - 120.0, LANE_Y - 56.0, 54, Color::from_rgba(255, 240, 170, 255));
+        self.draw_ui_text(&format!("Score: {}", session.score.score), 320.0, 570.0, 36, WHITE);
+        self.draw_ui_text(&session.score.combo.to_string(), TARGET_X - 120.0, LANE_Y - 56.0, 54, Color::from_rgba(255, 240, 170, 255));
         self.draw_ui_text("F/J: Don  D/K: Kat  Roll: drum  ESC: result", 40.0, 630.0, 30, Color::from_rgba(170, 180, 200, 255));
         self.draw_ui_text(&format!("Offset: {}ms ([ / ])", self.config.timing_offset_ms), 900.0, 570.0, 30, Color::from_rgba(220, 230, 255, 255));
 
-        if self.current_active_roll(now).is_some() {
-            self.draw_ui_text(&format!("連打: {}", self.roll_hit_count), TARGET_X - 55.0, LANE_Y - 72.0, 30, Color::from_rgba(255, 245, 180, 255));
+        if session.active_roll(now, offset).is_some() {
+            self.draw_ui_text(&format!("連打: {}", session.roll_hit_count), TARGET_X - 55.0, LANE_Y - 72.0, 30, Color::from_rgba(255, 245, 180, 255));
         }
 
         if self.config.debug {
@@ -577,22 +421,20 @@ impl TaikoSimApp {
                 self.draw_ui_text(&format!("SE SampleRate: {}Hz", se.sample_rate), 700.0, 124.0, 24, Color::from_rgba(170, 255, 170, 255));
             }
             if chart.has_branch {
-                let total = self.section_perfect + self.section_good + self.section_miss;
-                let accuracy = if total == 0 { 0.0 } else {
-                    (self.section_perfect as f64 + self.section_good as f64 * 0.5) / total as f64 * 100.0
-                };
-                self.draw_ui_text(&format!("Section: 良:{} 可:{} 不可:{} R:{}", self.section_perfect, self.section_good, self.section_miss, self.section_rolls), 700.0, 152.0, 24, Color::from_rgba(170, 255, 170, 255));
-                self.draw_ui_text(&format!("Accuracy: {:.1}%", accuracy), 700.0, 180.0, 24, Color::from_rgba(170, 255, 170, 255));
+                let section = session.section;
+                self.draw_ui_text(&format!("Section: 良:{} 可:{} 不可:{} R:{}", section.perfect, section.good, section.miss, section.rolls), 700.0, 152.0, 24, Color::from_rgba(170, 255, 170, 255));
+                self.draw_ui_text(&format!("Accuracy: {:.1}%", section.accuracy()), 700.0, 180.0, 24, Color::from_rgba(170, 255, 170, 255));
             }
         }
     }
 
-    fn draw_rolls(&self, chart: &Chart, now: f64, cur_branch: Branch) {
-        for roll in &chart.rolls {
-            if let Some(b) = roll.branch { if b != cur_branch { continue; } }
+    fn draw_rolls(&self, session: &PlaySession, now: f64) {
+        let offset = self.timing_offset_sec();
+        for roll in &session.chart.rolls {
+            if !session.is_on_current_branch(roll.branch) { continue; }
             let scroll = roll.scroll_speed as f32;
-            let start_diff = (roll.start_sec - chart.offset_sec + self.timing_offset_sec()) - now;
-            let end_diff = (roll.end_sec - chart.offset_sec + self.timing_offset_sec()) - now;
+            let start_diff = session.game_time(roll.start_sec, offset) - now;
+            let end_diff = session.game_time(roll.end_sec, offset) - now;
 
             if end_diff < -SCROLL_BEHIND_SEC || start_diff > SCROLL_AHEAD_SEC { continue; }
 
@@ -611,29 +453,20 @@ impl TaikoSimApp {
         }
     }
 
-    fn current_active_roll(&self, now: f64) -> Option<&Roll> {
-        let chart = self.chart.as_ref()?;
-        let cur_branch = self.current_branch;
-        chart.rolls.iter().find(|r| {
-            if let Some(b) = r.branch { if b != cur_branch { return false; } }
-            let s = r.start_sec - chart.offset_sec + self.timing_offset_sec();
-            let e = r.end_sec - chart.offset_sec + self.timing_offset_sec();
-            now >= s && now <= e
-        })
-    }
-
     fn draw_result(&self) {
         clear_background(Color::from_rgba(24, 26, 33, 255));
         self.draw_ui_text("Result", 60.0, 70.0, 56, WHITE);
         let song_name = self.current_song.as_ref().map(|s| s.title.clone()).unwrap_or_else(|| "Unknown".to_string());
         self.draw_ui_text(&song_name, 80.0, 130.0, 36, Color::from_rgba(200, 220, 255, 255));
 
+        let default_score = ScoreState::default();
+        let score = self.session.as_ref().map_or(&default_score, |s| &s.score);
         let stats = [
-            format!("Score: {}", self.score.score),
-            format!("Max Combo: {}", self.score.max_combo),
-            format!("良: {}", self.score.perfect),
-            format!("可: {}", self.score.good),
-            format!("不可: {}", self.score.miss),
+            format!("Score: {}", score.score),
+            format!("Max Combo: {}", score.max_combo),
+            format!("良: {}", score.perfect),
+            format!("可: {}", score.good),
+            format!("不可: {}", score.miss),
         ];
         for (i, line) in stats.iter().enumerate() {
             self.draw_ui_text(line, 80.0, 200.0 + i as f32 * 56.0, 40, Color::from_rgba(230, 230, 230, 255));
