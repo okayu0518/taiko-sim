@@ -14,12 +14,18 @@ struct CourseBlock {
 }
 
 pub fn parse_tja(path: &Path, preferred_course: Option<&str>) -> Result<(Chart, Option<String>), String> {
-    let text = read_tja_text(path)?;
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let text = decode_tja_bytes(bytes);
+    parse_tja_text(&text, preferred_course).map_err(|e| format!("{} in {}", e, path.display()))
+}
+
+/// Parse TJA source text. Returns the chart and the `WAVE` header, if any.
+fn parse_tja_text(text: &str, preferred_course: Option<&str>) -> Result<(Chart, Option<String>), String> {
     let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
 
     let (blocks, global_headers) = extract_course_blocks(&lines);
     if blocks.is_empty() {
-        return Err(format!("No #START/#END block found in {}", path.display()));
+        return Err("No #START/#END block found".to_string());
     }
 
     let selected = select_block(&blocks, preferred_course);
@@ -33,20 +39,20 @@ pub fn parse_tja(path: &Path, preferred_course: Option<&str>) -> Result<(Chart, 
     Ok((chart, wave))
 }
 
-fn read_tja_text(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-
-    if let Ok(s) = String::from_utf8(bytes.clone()) {
-        return Ok(strip_bom(s));
-    }
+/// Decode TJA bytes as UTF-8 (BOM stripped), falling back to Shift_JIS.
+fn decode_tja_bytes(bytes: Vec<u8>) -> String {
+    let bytes = match String::from_utf8(bytes) {
+        Ok(s) => return strip_bom(s),
+        Err(e) => e.into_bytes(),
+    };
 
     let (decoded_sjis, _, had_errors_sjis) = SHIFT_JIS.decode(&bytes);
     if !had_errors_sjis {
-        return Ok(decoded_sjis.to_string());
+        return decoded_sjis.to_string();
     }
 
     let (decoded_utf8, _, _) = UTF_8.decode(&bytes);
-    Ok(strip_bom(decoded_utf8.to_string()))
+    strip_bom(decoded_utf8.to_string())
 }
 
 fn strip_bom(mut s: String) -> String {
