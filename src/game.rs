@@ -8,7 +8,7 @@ use std::time::Instant;
 use macroquad::prelude::*;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 
-use crate::models::{AppConfig, KeybindConfig, NoteKind, ScoreState, SongEntry};
+use crate::models::{AppConfig, KeybindConfig, NoteKind, ScoreState, ScrollSpeed, SongEntry};
 
 use crate::effects::{note_color, Effects};
 use crate::gameplay::{HitOutcome, PlaySession};
@@ -16,8 +16,9 @@ use crate::judge::Judge;
 use crate::repository::load_song_entries;
 use crate::tja_parser::parse_tja;
 
-const SCROLL_AHEAD_SEC: f64 = 2.0;
 const SCROLL_BEHIND_SEC: f64 = 0.25;
+/// Pixels per beat at `#SCROLL 1`. One 4/4 measure spans roughly the judge circle to the lane end.
+const PX_PER_BEAT: f32 = 240.0;
 
 const BASE_W: f32 = 1280.0;
 const BASE_H: f32 = 720.0;
@@ -29,7 +30,6 @@ const JUDGE_RING_RADIUS: f32 = 26.0;
 const LANE_X: f32 = 140.0;
 const LANE_W: f32 = 1110.0;
 const LANE_H: f32 = 120.0;
-const SCROLL_PIXELS: f32 = 860.0;
 
 enum Scene {
     SongSelect,
@@ -389,10 +389,11 @@ impl TaikoSimApp {
             if !session.is_on_current_branch(note.branch) { continue; }
 
             let diff = session.game_time(note.time_sec, offset) - now;
-            if !(-SCROLL_BEHIND_SEC..=SCROLL_AHEAD_SEC).contains(&diff) { continue; }
+            if diff < -SCROLL_BEHIND_SEC { continue; }
 
-            let x = TARGET_X + ((diff / SCROLL_AHEAD_SEC) as f32) * SCROLL_PIXELS * (note.scroll_speed as f32);
+            let x = scroll_x(diff, note.speed);
             let radius = note_radius(note.big);
+            if !is_x_visible(x, radius) { continue; }
             draw_circle(x, LANE_Y, radius, note_color(note.kind));
             draw_circle_lines(x, LANE_Y, radius, 2.0, BLACK);
         }
@@ -432,14 +433,13 @@ impl TaikoSimApp {
         let offset = self.timing_offset_sec();
         for roll in &session.chart.rolls {
             if !session.is_on_current_branch(roll.branch) { continue; }
-            let scroll = roll.scroll_speed as f32;
             let start_diff = session.game_time(roll.start_sec, offset) - now;
             let end_diff = session.game_time(roll.end_sec, offset) - now;
+            if end_diff < -SCROLL_BEHIND_SEC { continue; }
 
-            if end_diff < -SCROLL_BEHIND_SEC || start_diff > SCROLL_AHEAD_SEC { continue; }
-
-            let start_x = TARGET_X + ((start_diff / SCROLL_AHEAD_SEC) as f32) * SCROLL_PIXELS * scroll;
-            let end_x = TARGET_X + ((end_diff / SCROLL_AHEAD_SEC) as f32) * SCROLL_PIXELS * scroll;
+            let start_x = scroll_x(start_diff, roll.head_speed);
+            let end_x = scroll_x(end_diff, roll.tail_speed);
+            if start_x.max(end_x) < LANE_X || start_x.min(end_x) > LANE_X + LANE_W { continue; }
             let body_left = start_x.min(end_x).max(LANE_X);
             let body_right = start_x.max(end_x).min(LANE_X + LANE_W);
 
@@ -537,6 +537,16 @@ impl TaikoSimApp {
     }
 }
 
+/// Horizontal position of an object `diff_sec` seconds before its hit time.
+fn scroll_x(diff_sec: f64, speed: ScrollSpeed) -> f32 {
+    TARGET_X + (diff_sec * speed.beats_per_sec()) as f32 * PX_PER_BEAT
+}
+
+/// Whether a circle of `radius` at `x` overlaps the lane.
+fn is_x_visible(x: f32, radius: f32) -> bool {
+    x + radius >= LANE_X && x - radius <= LANE_X + LANE_W
+}
+
 fn note_radius(big: bool) -> f32 {
     if big { BIG_NOTE_RADIUS } else { NOTE_RADIUS }
 }
@@ -571,5 +581,41 @@ fn parse_keycode(raw: &str) -> Option<KeyCode> {
         "UP" => Some(KeyCode::Up), "DOWN" => Some(KeyCode::Down),
         "SPACE" => Some(KeyCode::Space), "ENTER" => Some(KeyCode::Enter), "TAB" => Some(KeyCode::Tab),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BPM120: ScrollSpeed = ScrollSpeed { bpm: 120.0, scroll: 1.0 };
+
+    #[test]
+    fn object_at_hit_time_is_on_judge_circle() {
+        assert_eq!(scroll_x(0.0, BPM120), TARGET_X);
+    }
+
+    #[test]
+    fn one_beat_ahead_is_px_per_beat_away() {
+        // BPM 120: one beat = 0.5s.
+        assert_eq!(scroll_x(0.5, BPM120), TARGET_X + PX_PER_BEAT);
+        assert_eq!(scroll_x(-0.5, BPM120), TARGET_X - PX_PER_BEAT);
+    }
+
+    #[test]
+    fn speed_scales_with_bpm_and_scroll() {
+        let base = scroll_x(0.5, BPM120) - TARGET_X;
+        let bpm240 = scroll_x(0.5, ScrollSpeed { bpm: 240.0, scroll: 1.0 }) - TARGET_X;
+        let scroll_half = scroll_x(0.5, ScrollSpeed { bpm: 120.0, scroll: 0.5 }) - TARGET_X;
+        assert_eq!(bpm240, base * 2.0);
+        assert_eq!(scroll_half, base * 0.5);
+    }
+
+    #[test]
+    fn visibility_includes_partially_overlapping_notes() {
+        assert!(is_x_visible(LANE_X - 10.0, NOTE_RADIUS));
+        assert!(!is_x_visible(LANE_X - NOTE_RADIUS - 1.0, NOTE_RADIUS));
+        assert!(is_x_visible(LANE_X + LANE_W + 10.0, NOTE_RADIUS));
+        assert!(!is_x_visible(LANE_X + LANE_W + NOTE_RADIUS + 1.0, NOTE_RADIUS));
     }
 }

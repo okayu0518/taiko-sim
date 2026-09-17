@@ -3,7 +3,7 @@ use std::path::Path;
 
 use encoding_rs::{SHIFT_JIS, UTF_8};
 
-use crate::models::{Branch, BranchPoint, Chart, Note, NoteKind, Roll};
+use crate::models::{Branch, BranchPoint, Chart, Note, NoteKind, Roll, ScrollSpeed};
 
 const COURSE_PRIORITY: [&str; 4] = ["oni", "hard", "normal", "easy"];
 
@@ -179,7 +179,7 @@ fn build_chart(
     let mut current_branch: Option<Branch> = None;
     let mut branch_start_time: Option<f64> = None;
     let mut max_branch_time = 0.0_f64;
-    let mut open_rolls: Vec<(f64, bool, bool, Option<Branch>)> = Vec::new();
+    let mut open_rolls: Vec<OpenRoll> = Vec::new();
     let mut current_time = 0.0_f64;
     let mut current_bpm = bpm;
     let mut current_scroll = 1.0_f64;
@@ -305,15 +305,8 @@ fn build_chart(
         );
     }
 
-    while let Some((start, big, balloon, branch)) = open_rolls.pop() {
-        rolls.push(Roll {
-            start_sec: start,
-            end_sec: current_time,
-            big,
-            balloon,
-            branch,
-            scroll_speed: current_scroll,
-        });
+    while let Some(open) = open_rolls.pop() {
+        rolls.push(open.close(current_time, ScrollSpeed { bpm: current_bpm, scroll: current_scroll }));
     }
 
     let duration_sec = current_time + 2.0;
@@ -330,11 +323,34 @@ fn build_chart(
     })
 }
 
+/// A roll whose end (`8`) has not been read yet.
+struct OpenRoll {
+    start_sec: f64,
+    big: bool,
+    balloon: bool,
+    branch: Option<Branch>,
+    head_speed: ScrollSpeed,
+}
+
+impl OpenRoll {
+    fn close(self, end_sec: f64, tail_speed: ScrollSpeed) -> Roll {
+        Roll {
+            start_sec: self.start_sec,
+            end_sec,
+            big: self.big,
+            balloon: self.balloon,
+            branch: self.branch,
+            head_speed: self.head_speed,
+            tail_speed,
+        }
+    }
+}
+
 fn consume_measure(
     measure_buf: &str,
     notes: &mut Vec<Note>,
     rolls: &mut Vec<Roll>,
-    open_rolls: &mut Vec<(f64, bool, bool, Option<Branch>)>,
+    open_rolls: &mut Vec<OpenRoll>,
     current_time: f64,
     bpm: f64,
     scroll: f64,
@@ -350,8 +366,10 @@ fn consume_measure(
     }
 
     let step = measure_sec / measure_buf.len() as f64;
+    let speed = ScrollSpeed { bpm, scroll };
     for (idx, ch) in measure_buf.chars().enumerate() {
         let note_time = current_time + idx as f64 * step;
+        let open_roll = |big, balloon| OpenRoll { start_sec: note_time, big, balloon, branch, head_speed: speed };
         match ch {
             '1' | '3' => notes.push(Note {
                 time_sec: note_time,
@@ -360,7 +378,7 @@ fn consume_measure(
                 hit: false,
                 big: ch == '3',
                 branch,
-                scroll_speed: scroll,
+                speed,
             }),
             '2' | '4' => notes.push(Note {
                 time_sec: note_time,
@@ -369,21 +387,14 @@ fn consume_measure(
                 hit: false,
                 big: ch == '4',
                 branch,
-                scroll_speed: scroll,
+                speed,
             }),
-            '5' => open_rolls.push((note_time, false, false, branch)),
-            '6' => open_rolls.push((note_time, true, false, branch)),
-            '7' | '9' => open_rolls.push((note_time, true, true, branch)),
+            '5' => open_rolls.push(open_roll(false, false)),
+            '6' => open_rolls.push(open_roll(true, false)),
+            '7' | '9' => open_rolls.push(open_roll(true, true)),
             '8' => {
-                if let Some((start, big, balloon, b)) = open_rolls.pop() {
-                    rolls.push(Roll {
-                        start_sec: start,
-                        end_sec: note_time,
-                        big,
-                        balloon,
-                        branch: b,
-                        scroll_speed: scroll,
-                    });
+                if let Some(open) = open_rolls.pop() {
+                    rolls.push(open.close(note_time, speed));
                 }
             }
             _ => {}
@@ -603,11 +614,31 @@ mod tests {
         assert_times(&note_times(&chart), &[0.0, 2.5]);
     }
 
+    fn speeds(chart: &Chart) -> Vec<(f64, f64)> {
+        chart.notes.iter().map(|n| (n.speed.bpm, n.speed.scroll)).collect()
+    }
+
     #[test]
     fn scroll_applies_to_following_notes() {
         let chart = parse_body("1,\n#SCROLL 1.5\n1,");
-        let scrolls: Vec<_> = chart.notes.iter().map(|n| n.scroll_speed).collect();
-        assert_eq!(scrolls, vec![1.0, 1.5]);
+        assert_eq!(speeds(&chart), vec![(120.0, 1.0), (120.0, 1.5)]);
+    }
+
+    #[test]
+    fn notes_record_bpm_for_scroll_speed() {
+        let chart = parse_body("1,\n#BPMCHANGE 240\n1,");
+        assert_eq!(speeds(&chart), vec![(120.0, 1.0), (240.0, 1.0)]);
+    }
+
+    #[test]
+    fn roll_head_and_tail_keep_their_own_speed() {
+        let chart = parse_body("5000,\n#BPMCHANGE 240\n#SCROLL 2\n8000,\n6000,");
+        let speed = |r: &Roll| ((r.head_speed.bpm, r.head_speed.scroll), (r.tail_speed.bpm, r.tail_speed.scroll));
+        assert_eq!(chart.rolls.iter().map(speed).collect::<Vec<_>>(), vec![
+            ((120.0, 1.0), (240.0, 2.0)),
+            // Unclosed roll ends with the final state.
+            ((240.0, 2.0), (240.0, 2.0)),
+        ]);
     }
 
     // --- rolls ---

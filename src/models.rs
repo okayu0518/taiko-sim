@@ -22,6 +22,20 @@ pub enum Branch {
     Master,
 }
 
+/// Scroll state of a chart object. Visual speed is proportional to `bpm * scroll`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ScrollSpeed {
+    pub bpm: f64,
+    pub scroll: f64,
+}
+
+impl ScrollSpeed {
+    /// Beats scrolled per second.
+    pub fn beats_per_sec(&self) -> f64 {
+        self.bpm / 60.0 * self.scroll
+    }
+}
+
 #[derive(Clone)]
 pub struct Note {
     pub time_sec: f64,
@@ -30,7 +44,7 @@ pub struct Note {
     pub hit: bool,
     pub big: bool,
     pub branch: Option<Branch>,
-    pub scroll_speed: f64,
+    pub speed: ScrollSpeed,
 }
 
 #[derive(Clone)]
@@ -40,7 +54,8 @@ pub struct Roll {
     pub big: bool,
     pub balloon: bool,
     pub branch: Option<Branch>,
-    pub scroll_speed: f64,
+    pub head_speed: ScrollSpeed,
+    pub tail_speed: ScrollSpeed,
 }
 
 #[derive(Clone)]

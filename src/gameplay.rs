@@ -207,14 +207,16 @@ impl PlaySession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Note;
+    use crate::models::{Note, ScrollSpeed};
+
+    const SPEED: ScrollSpeed = ScrollSpeed { bpm: 120.0, scroll: 1.0 };
 
     fn note(time_sec: f64, kind: NoteKind) -> Note {
-        Note { time_sec, kind, judged: false, hit: false, big: false, branch: None, scroll_speed: 1.0 }
+        Note { time_sec, kind, judged: false, hit: false, big: false, branch: None, speed: SPEED }
     }
 
     fn roll(start_sec: f64, end_sec: f64, balloon: bool) -> Roll {
-        Roll { start_sec, end_sec, big: false, balloon, branch: None, scroll_speed: 1.0 }
+        Roll { start_sec, end_sec, big: false, balloon, branch: None, head_speed: SPEED, tail_speed: SPEED }
     }
 
     fn branch_point(time_sec: f64, requirement_type: char, expert: f64, master: f64) -> BranchPoint {
