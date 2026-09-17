@@ -10,12 +10,10 @@ use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 
 use crate::models::{AppConfig, Branch, BranchPoint, Chart, KeybindConfig, NoteKind, Roll, ScoreState, SongEntry};
 
+use crate::judge::{is_passed, judge_hit, Judge, WINDOW_KA};
 use crate::repository::load_song_entries;
 use crate::tja_parser::parse_tja;
 
-const JUDGE_PERFECT: f64 = 0.050;
-const JUDGE_GOOD: f64 = 0.100;
-const MISS_WINDOW: f64 = 0.140;
 const SCROLL_AHEAD_SEC: f64 = 2.0;
 const SCROLL_BEHIND_SEC: f64 = 0.25;
 const ROLL_HIT_SCORE: i32 = 30;
@@ -298,7 +296,7 @@ impl TaikoSimApp {
                 if let Some(b) = note.branch { if b != cur_branch { continue; } }
 
                 let note_time = note.time_sec - chart.offset_sec + timing_offset_sec;
-                if now - note_time > MISS_WINDOW {
+                if is_passed(now - note_time) {
                     note.judged = true;
                     note.hit = false;
                     miss_count += 1;
@@ -307,7 +305,7 @@ impl TaikoSimApp {
             if now > chart.duration_sec + 1.0 { self.to_result(); }
         }
 
-        for _ in 0..miss_count { self.register_judge("Miss"); }
+        for _ in 0..miss_count { self.register_judge(Judge::Fuka); }
     }
 
     fn check_branch_points(&mut self, now: f64) {
@@ -424,34 +422,24 @@ impl TaikoSimApp {
         let now = self.current_time_sec();
         if self.hit_roll_if_active(now, input_kind) { return; }
 
-        let Some((idx, delta)) = self.find_nearest_note(now, MISS_WINDOW) else { return; };
+        // Wrong-color or out-of-window inputs are ignored, like the original game.
+        let Some((idx, delta)) = self.find_nearest_note(now, WINDOW_KA, input_kind) else { return; };
+        let Some(judge) = judge_hit(delta) else { return; };
         let Some(chart) = self.chart.as_mut() else { return; };
         let note = &mut chart.notes[idx];
-
-        if note.kind != input_kind {
-            note.judged = true;
-            note.hit = false;
-            self.register_judge("Miss");
-            return;
-        }
-
-        if delta <= JUDGE_PERFECT {
-            note.judged = true; note.hit = true; self.register_judge("Perfect");
-        } else if delta <= JUDGE_GOOD {
-            note.judged = true; note.hit = true; self.register_judge("Good");
-        } else {
-            note.judged = true; note.hit = false; self.register_judge("Miss");
-        }
+        note.judged = true;
+        note.hit = true;
+        self.register_judge(judge);
     }
 
-    fn find_nearest_note(&self, now: f64, window: f64) -> Option<(usize, f64)> {
+    fn find_nearest_note(&self, now: f64, window: f64, kind: NoteKind) -> Option<(usize, f64)> {
         let chart = self.chart.as_ref()?;
         let mut best = None;
         let mut best_abs = f64::MAX;
         let cur_branch = self.current_branch;
 
         for (idx, note) in chart.notes.iter().enumerate() {
-            if note.judged { continue; }
+            if note.judged || note.kind != kind { continue; }
             if let Some(b) = note.branch { if b != cur_branch { continue; } }
 
             let note_time = note.time_sec - chart.offset_sec + self.timing_offset_sec();
@@ -484,22 +472,15 @@ impl TaikoSimApp {
         false
     }
 
-    fn register_judge(&mut self, judge: &str) {
-        self.score.last_judge = judge.to_string();
+    fn register_judge(&mut self, judge: Judge) {
+        self.score.last_judge = judge.label().to_string();
+        self.score.score += judge.score();
         match judge {
-            "Perfect" => {
-                self.score.perfect += 1; self.score.score += 300; self.score.combo += 1;
-                self.section_perfect += 1;
-            }
-            "Good" => {
-                self.score.good += 1; self.score.score += 100; self.score.combo += 1;
-                self.section_good += 1;
-            }
-            _ => {
-                self.score.miss += 1; self.score.combo = 0;
-                self.section_miss += 1;
-            }
+            Judge::Ryo => { self.score.perfect += 1; self.section_perfect += 1; }
+            Judge::Ka => { self.score.good += 1; self.section_good += 1; }
+            Judge::Fuka => { self.score.miss += 1; self.section_miss += 1; }
         }
+        if judge.keeps_combo() { self.score.combo += 1; } else { self.score.combo = 0; }
         self.score.max_combo = self.score.max_combo.max(self.score.combo);
     }
 
@@ -586,7 +567,7 @@ impl TaikoSimApp {
                 let accuracy = if total == 0 { 0.0 } else {
                     (self.section_perfect as f64 + self.section_good as f64 * 0.5) / total as f64 * 100.0
                 };
-                self.draw_ui_text(&format!("Section: P:{} G:{} M:{} R:{}", self.section_perfect, self.section_good, self.section_miss, self.section_rolls), 700.0, 152.0, 24, Color::from_rgba(170, 255, 170, 255));
+                self.draw_ui_text(&format!("Section: 良:{} 可:{} 不可:{} R:{}", self.section_perfect, self.section_good, self.section_miss, self.section_rolls), 700.0, 152.0, 24, Color::from_rgba(170, 255, 170, 255));
                 self.draw_ui_text(&format!("Accuracy: {:.1}%", accuracy), 700.0, 180.0, 24, Color::from_rgba(170, 255, 170, 255));
             }
         }
@@ -636,9 +617,9 @@ impl TaikoSimApp {
         let stats = [
             format!("Score: {}", self.score.score),
             format!("Max Combo: {}", self.score.max_combo),
-            format!("Perfect: {}", self.score.perfect),
-            format!("Good: {}", self.score.good),
-            format!("Miss: {}", self.score.miss),
+            format!("良: {}", self.score.perfect),
+            format!("可: {}", self.score.good),
+            format!("不可: {}", self.score.miss),
         ];
         for (i, line) in stats.iter().enumerate() {
             self.draw_ui_text(line, 80.0, 200.0 + i as f32 * 56.0, 40, Color::from_rgba(230, 230, 230, 255));

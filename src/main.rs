@@ -1,4 +1,5 @@
 mod game;
+mod judge;
 mod models;
 mod repository;
 mod tja_parser;
