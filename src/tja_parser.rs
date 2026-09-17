@@ -3,7 +3,7 @@ use std::path::Path;
 
 use encoding_rs::{SHIFT_JIS, UTF_8};
 
-use crate::models::{Branch, BranchCondition, BranchPoint, Chart, LevelHold, Note, NoteKind, Roll, ScrollSpeed};
+use crate::models::{Branch, BranchCondition, BranchPoint, Chart, GogoRange, LevelHold, Note, NoteKind, Roll, ScrollSpeed};
 
 const COURSE_PRIORITY: [&str; 4] = ["oni", "hard", "normal", "easy"];
 
@@ -178,11 +178,12 @@ fn build_chart(
     let mut section_resets = Vec::new();
     let mut level_holds = Vec::new();
     let mut has_branch = false;
-    let mut current_branch: Option<Branch> = None;
     let mut branch_start_time: Option<f64> = None;
+    // Gogo state at #BRANCHSTART; every branch starts from it.
+    let mut branch_start_gogo = false;
     let mut max_branch_time = 0.0_f64;
     let mut open_rolls: Vec<OpenRoll> = Vec::new();
-    let mut timing = TimingState { time: 0.0, bpm, scroll: 1.0 };
+    let mut timing = TimingState { time: 0.0, bpm, scroll: 1.0, branch: None, gogo_since: None, gogo_ranges: Vec::new() };
     let mut measure_num = 4_i32;
     let mut measure_den = 4_i32;
     let mut measure_items: Vec<MeasureItem> = Vec::new();
@@ -213,8 +214,9 @@ fn build_chart(
             } else if cmd_upper.starts_with("BRANCHSTART") {
                 // A new branch without #BRANCHEND first merges the previous one.
                 if branch_start_time.is_some() {
-                    timing.time = max_branch_time.max(timing.time);
+                    timing.move_to(max_branch_time.max(timing.time), timing.branch, timing.is_gogo());
                 }
+                branch_start_gogo = timing.is_gogo();
                 has_branch = true;
                 branch_start_time = Some(timing.time);
                 max_branch_time = timing.time;
@@ -227,20 +229,20 @@ fn build_chart(
             } {
                 if let Some(start) = branch_start_time {
                     max_branch_time = max_branch_time.max(timing.time);
-                    timing.time = start;
+                    timing.move_to(start, Some(branch), branch_start_gogo);
+                } else {
+                    timing.move_to(timing.time, Some(branch), timing.is_gogo());
                 }
-                current_branch = Some(branch);
             } else if cmd_upper == "BRANCHEND" {
-                if branch_start_time.is_some() {
-                    max_branch_time = max_branch_time.max(timing.time);
-                    timing.time = max_branch_time;
-                    branch_start_time = None;
-                }
-                current_branch = None;
+                let end = match branch_start_time.take() {
+                    Some(_) => max_branch_time.max(timing.time),
+                    None => timing.time,
+                };
+                timing.move_to(end, None, timing.is_gogo());
             } else if cmd_upper == "SECTION" {
                 section_resets.push(timing.time);
             } else if cmd_upper == "LEVELHOLD" {
-                level_holds.push(LevelHold { time_sec: timing.time, branch: current_branch });
+                level_holds.push(LevelHold { time_sec: timing.time, branch: timing.branch });
             }
             continue;
         }
@@ -256,7 +258,6 @@ fn build_chart(
                     &mut open_rolls,
                     measure_num,
                     measure_den,
-                    current_branch,
                 );
                 last_measure_sec = timing.time - measure_start;
                 measure_items.clear();
@@ -275,13 +276,13 @@ fn build_chart(
             &mut open_rolls,
             measure_num,
             measure_den,
-            current_branch,
         );
     }
 
     while let Some(open) = open_rolls.pop() {
         rolls.push(open.close(timing.time, timing.speed()));
     }
+    timing.close_gogo();
 
     let duration_sec = timing.time + 2.0;
     Ok(Chart {
@@ -294,6 +295,7 @@ fn build_chart(
         branch_points,
         section_resets,
         level_holds,
+        gogo_ranges: timing.gogo_ranges,
         has_branch,
         duration_sec,
     })
@@ -324,11 +326,15 @@ fn parse_branch_start(args: &str, start_time_sec: f64, previous_measure_sec: f64
     }
 }
 
-/// Current position and scroll state while reading a chart.
+/// Current position, branch, scroll and gogo state while reading a chart.
 struct TimingState {
     time: f64,
     bpm: f64,
     scroll: f64,
+    branch: Option<Branch>,
+    /// Start time of the open gogo range.
+    gogo_since: Option<f64>,
+    gogo_ranges: Vec<GogoRange>,
 }
 
 impl TimingState {
@@ -336,28 +342,62 @@ impl TimingState {
         ScrollSpeed { bpm: self.bpm, scroll: self.scroll }
     }
 
+    fn is_gogo(&self) -> bool {
+        self.gogo_since.is_some()
+    }
+
     fn apply(&mut self, item: &MeasureItem) {
         match *item {
             MeasureItem::BpmChange(v) => self.bpm = v.max(1e-6),
             MeasureItem::Scroll(v) => self.scroll = v,
             MeasureItem::Delay(v) => self.time += v,
+            MeasureItem::GogoStart => {
+                self.gogo_since.get_or_insert(self.time);
+            }
+            MeasureItem::GogoEnd => self.close_gogo(),
             MeasureItem::Note(_) => {}
+        }
+    }
+
+    /// Close the open gogo range at the current time. Empty ranges are dropped.
+    fn close_gogo(&mut self) {
+        if let Some(start_sec) = self.gogo_since.take() {
+            if self.time > start_sec {
+                self.gogo_ranges.push(GogoRange { start_sec, end_sec: self.time, branch: self.branch });
+            }
+        }
+    }
+
+    /// Jump to `time` on `branch` (branch rewind/merge), splitting the gogo range there.
+    fn move_to(&mut self, time: f64, branch: Option<Branch>, gogo: bool) {
+        self.close_gogo();
+        self.time = time;
+        self.branch = branch;
+        if gogo {
+            self.gogo_since = Some(time);
         }
     }
 }
 
-/// An element of a measure: a note character or a timing command placed between notes.
+/// An element of a measure: a note character or a command placed between notes.
 enum MeasureItem {
     Note(char),
     BpmChange(f64),
     Scroll(f64),
     Delay(f64),
+    GogoStart,
+    GogoEnd,
 }
 
-/// Parse commands that may appear inside a measure (`#BPMCHANGE`, `#SCROLL`, `#DELAY`).
+/// Parse commands that may appear inside a measure
+/// (`#BPMCHANGE`, `#SCROLL`, `#DELAY`, `#GOGOSTART`, `#GOGOEND`).
 fn parse_timing_command(cmd: &str, cmd_upper: &str) -> Option<MeasureItem> {
     let value = |prefix: &str| cmd[prefix.len()..].trim().parse::<f64>().ok();
-    if cmd_upper.starts_with("BPMCHANGE") {
+    if cmd_upper == "GOGOSTART" {
+        Some(MeasureItem::GogoStart)
+    } else if cmd_upper == "GOGOEND" {
+        Some(MeasureItem::GogoEnd)
+    } else if cmd_upper.starts_with("BPMCHANGE") {
         Some(MeasureItem::BpmChange(value("BPMCHANGE")?))
     } else if cmd_upper.starts_with("SCROLL") {
         Some(MeasureItem::Scroll(value("SCROLL")?))
@@ -395,7 +435,6 @@ impl OpenRoll {
 ///
 /// Each note character takes an equal number of beats; its duration in
 /// seconds uses the BPM in effect at that character.
-#[allow(clippy::too_many_arguments)]
 fn consume_measure(
     items: &[MeasureItem],
     timing: &mut TimingState,
@@ -404,7 +443,6 @@ fn consume_measure(
     open_rolls: &mut Vec<OpenRoll>,
     measure_num: i32,
     measure_den: i32,
-    branch: Option<Branch>,
 ) {
     let measure_beats = 4.0 * (measure_num as f64 / measure_den.max(1) as f64);
     let note_count = items.iter().filter(|i| matches!(i, MeasureItem::Note(_))).count();
@@ -426,6 +464,8 @@ fn consume_measure(
 
         let note_time = timing.time;
         let speed = timing.speed();
+        let branch = timing.branch;
+        let gogo = timing.is_gogo();
         let open_roll = |big, balloon| OpenRoll { start_sec: note_time, big, balloon, branch, head_speed: speed };
         match ch {
             '1' | '3' => notes.push(Note {
@@ -436,6 +476,7 @@ fn consume_measure(
                 big: ch == '3',
                 branch,
                 speed,
+                gogo,
             }),
             '2' | '4' => notes.push(Note {
                 time_sec: note_time,
@@ -445,6 +486,7 @@ fn consume_measure(
                 big: ch == '4',
                 branch,
                 speed,
+                gogo,
             }),
             '5' => open_rolls.push(open_roll(false, false)),
             '6' => open_rolls.push(open_roll(true, false)),
@@ -835,6 +877,61 @@ mod tests {
         assert_eq!(chart.level_holds, vec![
             LevelHold { time_sec: 0.0, branch: Some(Branch::Master) },
             LevelHold { time_sec: 4.0, branch: None },
+        ]);
+    }
+
+    // --- gogo time ---
+
+    fn gogo_flags(chart: &Chart) -> Vec<bool> {
+        chart.notes.iter().map(|n| n.gogo).collect()
+    }
+
+    fn gogo_ranges(chart: &Chart) -> Vec<(f64, f64, Option<Branch>)> {
+        chart.gogo_ranges.iter().map(|r| (r.start_sec, r.end_sec, r.branch)).collect()
+    }
+
+    #[test]
+    fn gogo_time_flags_notes_and_records_range() {
+        let chart = parse_body("1,\n#GOGOSTART\n1,\n#GOGOEND\n1,");
+        assert_eq!(gogo_flags(&chart), vec![false, true, false]);
+        assert_eq!(gogo_ranges(&chart), vec![(2.0, 4.0, None)]);
+    }
+
+    #[test]
+    fn gogo_commands_inside_measure_apply_from_their_position() {
+        let chart = parse_body("10\n#GOGOSTART\n10\n#GOGOEND\n10,");
+        assert_eq!(gogo_flags(&chart), vec![false, true, false]);
+        let ranges = gogo_ranges(&chart);
+        assert_eq!(ranges.len(), 1);
+        assert_close(ranges[0].0, 2.0 / 3.0);
+        assert_close(ranges[0].1, 4.0 / 3.0);
+    }
+
+    #[test]
+    fn unclosed_gogo_ends_at_chart_end() {
+        let chart = parse_body("#GOGOSTART\n1,1,");
+        assert_eq!(gogo_ranges(&chart), vec![(0.0, 4.0, None)]);
+    }
+
+    #[test]
+    fn gogo_state_is_per_branch() {
+        let chart = parse_body(
+            "#GOGOSTART\n1,\n#BRANCHSTART r,1,2\n#N\n1,\n#E\n#GOGOEND\n1,\n#M\n1,\n#BRANCHEND\n1,",
+        );
+        // Each branch starts with the state at #BRANCHSTART; after #BRANCHEND the last branch's state continues.
+        let notes: Vec<_> = chart.notes.iter().map(|n| (n.time_sec, n.branch, n.gogo)).collect();
+        assert_eq!(notes, vec![
+            (0.0, None, true),
+            (2.0, Some(Branch::Normal), true),
+            (2.0, Some(Branch::Expert), false),
+            (2.0, Some(Branch::Master), true),
+            (4.0, None, true),
+        ]);
+        assert_eq!(gogo_ranges(&chart), vec![
+            (0.0, 2.0, None),
+            (2.0, 4.0, Some(Branch::Normal)),
+            (2.0, 4.0, Some(Branch::Master)),
+            (4.0, 6.0, None),
         ]);
     }
 

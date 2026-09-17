@@ -45,6 +45,8 @@ pub struct Note {
     pub big: bool,
     pub branch: Option<Branch>,
     pub speed: ScrollSpeed,
+    /// Inside gogo time.
+    pub gogo: bool,
 }
 
 #[derive(Clone)]
@@ -81,6 +83,15 @@ pub struct BranchPoint {
     pub master_threshold: f64,
 }
 
+/// Gogo time between `#GOGOSTART` and `#GOGOEND` (half-open, chart time).
+#[derive(Clone, PartialEq, Debug)]
+pub struct GogoRange {
+    pub start_sec: f64,
+    pub end_sec: f64,
+    /// Branch the range was written in; `None` outside branches.
+    pub branch: Option<Branch>,
+}
+
 /// `#LEVELHOLD`: once reached on its branch, later branch judgements keep the current branch.
 #[derive(Clone, PartialEq, Debug)]
 pub struct LevelHold {
@@ -101,6 +112,7 @@ pub struct Chart {
     /// Chart times of `#SECTION` (branch stats reset).
     pub section_resets: Vec<f64>,
     pub level_holds: Vec<LevelHold>,
+    pub gogo_ranges: Vec<GogoRange>,
     pub has_branch: bool,
     pub duration_sec: f64,
 }

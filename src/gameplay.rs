@@ -273,7 +273,7 @@ mod tests {
     const SPEED: ScrollSpeed = ScrollSpeed { bpm: 120.0, scroll: 1.0 };
 
     fn note(time_sec: f64, kind: NoteKind) -> Note {
-        Note { time_sec, kind, judged: false, hit: false, big: false, branch: None, speed: SPEED }
+        Note { time_sec, kind, judged: false, hit: false, big: false, branch: None, speed: SPEED, gogo: false }
     }
 
     fn roll(start_sec: f64, end_sec: f64, balloon: bool) -> Roll {
@@ -292,6 +292,7 @@ mod tests {
             branch_points,
             section_resets: vec![],
             level_holds: vec![],
+            gogo_ranges: vec![],
             duration_sec: 5.0,
         }
     }
