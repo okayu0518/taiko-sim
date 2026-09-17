@@ -69,13 +69,17 @@ pub struct PlaySession {
 
 impl PlaySession {
     pub fn new(chart: Chart) -> Self {
-        let mut branch_events: Vec<_> = chart.branch_points.iter().enumerate()
-            .map(|(i, bp)| (bp.judge_time_sec, BranchEvent::Judge(i)))
-            .chain(chart.section_resets.iter().map(|&t| (t, BranchEvent::SectionReset)))
-            .chain(chart.level_holds.iter().enumerate().map(|(i, h)| (h.time_sec, BranchEvent::LevelHold(i))))
+        // (time, tie-break key, event). At the same time, events are ordered by the chart
+        // position they belong to: a judgement by its section start, a level hold by its
+        // own time, and resets last. The stable sort keeps judgements first on equal keys,
+        // so a hold inside the section being judged still sees that section's branch.
+        let mut events: Vec<(f64, f64, BranchEvent)> = chart.branch_points.iter().enumerate()
+            .map(|(i, bp)| (bp.judge_time_sec, bp.start_time_sec, BranchEvent::Judge(i)))
+            .chain(chart.level_holds.iter().enumerate().map(|(i, h)| (h.time_sec, h.time_sec, BranchEvent::LevelHold(i))))
+            .chain(chart.section_resets.iter().map(|&t| (t, f64::INFINITY, BranchEvent::SectionReset)))
             .collect();
-        // Stable sort keeps judgements before resets at the same time.
-        branch_events.sort_by(|a, b| a.0.total_cmp(&b.0));
+        events.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let branch_events = events.into_iter().map(|(t, _, e)| (t, e)).collect();
 
         Self {
             chart,
@@ -667,6 +671,41 @@ mod tests {
     #[test]
     fn level_hold_without_branch_applies() {
         let mut s = level_hold_session(None);
+        s.check_branch_points(5.0, 0.0);
+        assert_eq!(s.current_branch(), Branch::Master);
+    }
+
+    #[test]
+    fn level_hold_in_previous_section_precedes_same_time_judgement() {
+        // One-measure branch: the hold at the start of section 1 (2.0) coincides with
+        // the judgement of section 2 (judged at 2.0, starts at 4.0).
+        let mut c = chart(vec![], vec![], vec![
+            branch_point(0.0, 2.0, BranchCondition::Roll, 1.0, 2.0),
+            branch_point(2.0, 4.0, BranchCondition::Roll, 1.0, 2.0),
+        ]);
+        c.level_holds = vec![LevelHold { time_sec: 2.0, branch: Some(Branch::Master) }];
+        let mut s = PlaySession::new(c);
+        s.section.rolls = 5;
+        s.check_branch_points(0.0, 0.0);
+        assert_eq!(s.current_branch(), Branch::Master);
+
+        s.check_branch_points(2.0, 0.0);
+        assert_eq!(s.branch_at(4.0), Branch::Master);
+    }
+
+    #[test]
+    fn level_hold_in_section_starting_at_judge_time_sees_that_section() {
+        // Branch at chart start: judged and started at 0.0, hold also at 0.0.
+        let mut c = chart(vec![], vec![], vec![
+            branch_point(0.0, 0.0, BranchCondition::Roll, 1.0, 2.0),
+            branch_point(5.0, 6.0, BranchCondition::Roll, 1.0, 2.0),
+        ]);
+        c.level_holds = vec![LevelHold { time_sec: 0.0, branch: Some(Branch::Master) }];
+        let mut s = PlaySession::new(c);
+        s.section.rolls = 5;
+        s.check_branch_points(0.0, 0.0);
+        assert_eq!(s.current_branch(), Branch::Master);
+
         s.check_branch_points(5.0, 0.0);
         assert_eq!(s.current_branch(), Branch::Master);
     }
