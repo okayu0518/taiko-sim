@@ -9,10 +9,50 @@ Linux で動く、KISS 方針の太鼓系リズムゲームシミュレータで
 
 ## クイックスタート
 
-## 1) 必要環境
+## 1) 必要環境（Linux）
 
 - Rust (stable)
 - Linux の一般的な音声環境（PulseAudio/PipeWire）
+- ビルドに必要なシステムパッケージ: C リンカ、`pkg-config`、ALSA 開発ヘッダ
+- 実行時に必要なライブラリ: X11 / Xi / OpenGL（Wayland 環境では EGL / wayland-client / xkbcommon）。デスクトップ環境なら通常は導入済みです。
+
+### Rust のインストール
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### システムパッケージ
+
+Ubuntu / Debian:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libasound2-dev
+# Runtime libraries (usually already installed on desktops)
+sudo apt-get install -y libx11-6 libxi6 libgl1
+```
+
+Fedora:
+
+```bash
+sudo dnf install -y gcc pkgconf-pkg-config alsa-lib-devel
+```
+
+Arch Linux:
+
+```bash
+sudo pacman -S --needed base-devel pkgconf alsa-lib
+```
+
+### ビルド確認
+
+```bash
+git clone git@github.com:okayu0518/taiko-sim.git
+cd taiko-sim
+cargo build
+cargo test
+```
 
 ## 2) サンプル譜面配置
 
@@ -106,6 +146,29 @@ cargo run
 - 連打ノーツ: `5/6/7/9` 開始、`8` 終了をパースして描画/加点
 - タイミング補正: `timing_offset_ms` を保存して再起動後も維持
 - 連打中は判定枠上に連打数を表示
+
+## 開発
+
+### テスト
+
+```bash
+cargo test                 # all unit tests
+cargo test gameplay        # filter by module/test name
+cargo test -- --ignored    # known limitations (expected to fail)
+```
+
+- テストは各モジュール内の `#[cfg(test)] mod tests` にあります。`data/` には依存しません。
+  - `judge.rs`: 判定幅・スコア
+  - `gameplay.rs`: 判定・見逃し・連打・分岐（`PlaySession`）
+  - `tja_parser.rs`: ヘッダ・コース選択・文字コード・ノーツ時刻・命令・分岐
+  - `repository.rs`: 曲フォルダ走査・`index.json`（一時ディレクトリを使用）
+  - `effects.rs`: エフェクトの寿命管理
+- ゲーム進行ロジックは描画・音声・入力から独立した `PlaySession`（`src/gameplay.rs`）にあります。判定や分岐を変更する場合はここにテストを追加してください。
+- `#[ignore]` 付きのテストは既知の未対応仕様です（例: 小節途中の `#BPMCHANGE`）。
+
+### CI
+
+GitHub Actions（`.github/workflows/ci.yml`）で `main` への push と Pull Request ごとに `cargo build --locked` と `cargo test --locked` を実行します（Ubuntu ランナー）。
 
 ## 文字コード対応
 
