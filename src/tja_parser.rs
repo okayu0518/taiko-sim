@@ -180,26 +180,21 @@ fn build_chart(
     let mut branch_start_time: Option<f64> = None;
     let mut max_branch_time = 0.0_f64;
     let mut open_rolls: Vec<OpenRoll> = Vec::new();
-    let mut current_time = 0.0_f64;
-    let mut current_bpm = bpm;
-    let mut current_scroll = 1.0_f64;
+    let mut timing = TimingState { time: 0.0, bpm, scroll: 1.0 };
     let mut measure_num = 4_i32;
     let mut measure_den = 4_i32;
-    let mut measure_buf = String::new();
+    let mut measure_items: Vec<MeasureItem> = Vec::new();
 
     for line in body_lines {
         if line.starts_with('#') {
             let cmd = line[1..].trim().to_string();
             let cmd_upper = cmd.to_uppercase();
-            if cmd_upper.starts_with("BPMCHANGE") {
-                let value = cmd[9..].trim();
-                if let Ok(v) = value.parse::<f64>() {
-                    current_bpm = v.max(1e-6);
-                }
-            } else if cmd_upper.starts_with("SCROLL") {
-                let value = cmd[6..].trim();
-                if let Ok(v) = value.parse::<f64>() {
-                    current_scroll = v;
+            if let Some(item) = parse_timing_command(&cmd, &cmd_upper) {
+                // Inside a measure, timing commands apply from their position.
+                if measure_items.iter().any(|i| matches!(i, MeasureItem::Note(_))) {
+                    measure_items.push(item);
+                } else {
+                    timing.apply(&item);
                 }
             } else if cmd_upper.starts_with("MEASURE") {
                 let value = cmd[7..].trim();
@@ -211,15 +206,10 @@ fn build_chart(
                         measure_den = v.max(1);
                     }
                 }
-            } else if cmd_upper.starts_with("DELAY") {
-                let value = cmd[5..].trim();
-                if let Ok(v) = value.parse::<f64>() {
-                    current_time += v;
-                }
             } else if cmd_upper.starts_with("BRANCHSTART") {
                 has_branch = true;
-                branch_start_time = Some(current_time);
-                max_branch_time = current_time;
+                branch_start_time = Some(timing.time);
+                max_branch_time = timing.time;
                 let args = cmd[11..].trim();
                 let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
                 if parts.len() >= 3 {
@@ -227,40 +217,33 @@ fn build_chart(
                     let expert_threshold = parts[1].parse::<f64>().unwrap_or(0.0);
                     let master_threshold = parts[2].parse::<f64>().unwrap_or(0.0);
                     branch_points.push(BranchPoint {
-                        time_sec: current_time,
+                        time_sec: timing.time,
                         requirement_type: req_type,
                         expert_threshold,
                         master_threshold,
                     });
                 }
-            } else if cmd_upper == "N" {
-                if let Some(_start) = branch_start_time {
-                    max_branch_time = max_branch_time.max(current_time);
-                    current_time = _start;
+            } else if let Some(branch) = match cmd_upper.as_str() {
+                "N" => Some(Branch::Normal),
+                "E" => Some(Branch::Expert),
+                "M" => Some(Branch::Master),
+                _ => None,
+            } {
+                if let Some(start) = branch_start_time {
+                    max_branch_time = max_branch_time.max(timing.time);
+                    timing.time = start;
                 }
-                current_branch = Some(Branch::Normal);
-            } else if cmd_upper == "E" {
-                if let Some(_start) = branch_start_time {
-                    max_branch_time = max_branch_time.max(current_time);
-                    current_time = _start;
-                }
-                current_branch = Some(Branch::Expert);
-            } else if cmd_upper == "M" {
-                if let Some(_start) = branch_start_time {
-                    max_branch_time = max_branch_time.max(current_time);
-                    current_time = _start;
-                }
-                current_branch = Some(Branch::Master);
+                current_branch = Some(branch);
             } else if cmd_upper == "BRANCHEND" {
-                if let Some(_start) = branch_start_time {
-                    max_branch_time = max_branch_time.max(current_time);
-                    current_time = max_branch_time;
+                if branch_start_time.is_some() {
+                    max_branch_time = max_branch_time.max(timing.time);
+                    timing.time = max_branch_time;
                     branch_start_time = None;
                 }
                 current_branch = None;
             } else if cmd_upper == "SECTION" {
                 branch_points.push(BranchPoint {
-                    time_sec: current_time,
+                    time_sec: timing.time,
                     requirement_type: 's', // section reset
                     expert_threshold: 0.0,
                     master_threshold: 0.0,
@@ -271,34 +254,30 @@ fn build_chart(
 
         for ch in line.chars() {
             if ch == ',' {
-                current_time = consume_measure(
-                    &measure_buf,
+                consume_measure(
+                    &measure_items,
+                    &mut timing,
                     &mut notes,
                     &mut rolls,
                     &mut open_rolls,
-                    current_time,
-                    current_bpm,
-                    current_scroll,
                     measure_num,
                     measure_den,
                     current_branch,
                 );
-                measure_buf.clear();
+                measure_items.clear();
             } else if ch.is_ascii_digit() {
-                measure_buf.push(ch);
+                measure_items.push(MeasureItem::Note(ch));
             }
         }
     }
 
-    if !measure_buf.is_empty() {
-        current_time = consume_measure(
-            &measure_buf,
+    if !measure_items.is_empty() {
+        consume_measure(
+            &measure_items,
+            &mut timing,
             &mut notes,
             &mut rolls,
             &mut open_rolls,
-            current_time,
-            current_bpm,
-            current_scroll,
             measure_num,
             measure_den,
             current_branch,
@@ -306,10 +285,10 @@ fn build_chart(
     }
 
     while let Some(open) = open_rolls.pop() {
-        rolls.push(open.close(current_time, ScrollSpeed { bpm: current_bpm, scroll: current_scroll }));
+        rolls.push(open.close(timing.time, timing.speed()));
     }
 
-    let duration_sec = current_time + 2.0;
+    let duration_sec = timing.time + 2.0;
     Ok(Chart {
         title,
         course,
@@ -321,6 +300,50 @@ fn build_chart(
         has_branch,
         duration_sec,
     })
+}
+
+/// Current position and scroll state while reading a chart.
+struct TimingState {
+    time: f64,
+    bpm: f64,
+    scroll: f64,
+}
+
+impl TimingState {
+    fn speed(&self) -> ScrollSpeed {
+        ScrollSpeed { bpm: self.bpm, scroll: self.scroll }
+    }
+
+    fn apply(&mut self, item: &MeasureItem) {
+        match *item {
+            MeasureItem::BpmChange(v) => self.bpm = v.max(1e-6),
+            MeasureItem::Scroll(v) => self.scroll = v,
+            MeasureItem::Delay(v) => self.time += v,
+            MeasureItem::Note(_) => {}
+        }
+    }
+}
+
+/// An element of a measure: a note character or a timing command placed between notes.
+enum MeasureItem {
+    Note(char),
+    BpmChange(f64),
+    Scroll(f64),
+    Delay(f64),
+}
+
+/// Parse commands that may appear inside a measure (`#BPMCHANGE`, `#SCROLL`, `#DELAY`).
+fn parse_timing_command(cmd: &str, cmd_upper: &str) -> Option<MeasureItem> {
+    let value = |prefix: &str| cmd[prefix.len()..].trim().parse::<f64>().ok();
+    if cmd_upper.starts_with("BPMCHANGE") {
+        Some(MeasureItem::BpmChange(value("BPMCHANGE")?))
+    } else if cmd_upper.starts_with("SCROLL") {
+        Some(MeasureItem::Scroll(value("SCROLL")?))
+    } else if cmd_upper.starts_with("DELAY") {
+        Some(MeasureItem::Delay(value("DELAY")?))
+    } else {
+        None
+    }
 }
 
 /// A roll whose end (`8`) has not been read yet.
@@ -346,29 +369,41 @@ impl OpenRoll {
     }
 }
 
+/// Emit the notes of one measure and advance `timing` to the next measure.
+///
+/// Each note character takes an equal number of beats; its duration in
+/// seconds uses the BPM in effect at that character.
+#[allow(clippy::too_many_arguments)]
 fn consume_measure(
-    measure_buf: &str,
+    items: &[MeasureItem],
+    timing: &mut TimingState,
     notes: &mut Vec<Note>,
     rolls: &mut Vec<Roll>,
     open_rolls: &mut Vec<OpenRoll>,
-    current_time: f64,
-    bpm: f64,
-    scroll: f64,
     measure_num: i32,
     measure_den: i32,
     branch: Option<Branch>,
-) -> f64 {
-    let beat_sec = 60.0 / bpm.max(1e-6);
-    let measure_sec = beat_sec * 4.0 * (measure_num as f64 / measure_den.max(1) as f64);
+) {
+    let measure_beats = 4.0 * (measure_num as f64 / measure_den.max(1) as f64);
+    let note_count = items.iter().filter(|i| matches!(i, MeasureItem::Note(_))).count();
 
-    if measure_buf.is_empty() {
-        return current_time + measure_sec;
+    if note_count == 0 {
+        for item in items {
+            timing.apply(item);
+        }
+        timing.time += measure_beats * 60.0 / timing.bpm;
+        return;
     }
 
-    let step = measure_sec / measure_buf.len() as f64;
-    let speed = ScrollSpeed { bpm, scroll };
-    for (idx, ch) in measure_buf.chars().enumerate() {
-        let note_time = current_time + idx as f64 * step;
+    let beats_per_char = measure_beats / note_count as f64;
+    for item in items {
+        let MeasureItem::Note(ch) = *item else {
+            timing.apply(item);
+            continue;
+        };
+
+        let note_time = timing.time;
+        let speed = timing.speed();
         let open_roll = |big, balloon| OpenRoll { start_sec: note_time, big, balloon, branch, head_speed: speed };
         match ch {
             '1' | '3' => notes.push(Note {
@@ -399,9 +434,8 @@ fn consume_measure(
             }
             _ => {}
         }
+        timing.time += beats_per_char * 60.0 / timing.bpm;
     }
-
-    current_time + measure_sec
 }
 
 fn clean_line(raw: &str) -> String {
@@ -595,11 +629,31 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known limitation: commands inside a measure apply to the whole measure"]
     fn bpm_change_inside_measure_affects_only_following_notes() {
         // First half at BPM 120 (1.0s), second half at BPM 240 (0.5s).
         let chart = parse_body("10\n#BPMCHANGE 240\n10,\n1,");
         assert_times(&note_times(&chart), &[0.0, 1.0, 1.5]);
+        assert_eq!(speeds(&chart), vec![(120.0, 1.0), (240.0, 1.0), (240.0, 1.0)]);
+    }
+
+    #[test]
+    fn scroll_inside_measure_affects_only_following_notes() {
+        let chart = parse_body("11\n#SCROLL 2\n11,");
+        assert_times(&note_times(&chart), &[0.0, 0.5, 1.0, 1.5]);
+        let scrolls: Vec<_> = speeds(&chart).into_iter().map(|(_, s)| s).collect();
+        assert_eq!(scrolls, vec![1.0, 1.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn delay_inside_measure_shifts_following_notes() {
+        let chart = parse_body("10\n#DELAY 0.25\n10,\n1,");
+        assert_times(&note_times(&chart), &[0.0, 1.25, 2.25]);
+    }
+
+    #[test]
+    fn commands_before_first_note_apply_to_whole_measure() {
+        let chart = parse_body("#BPMCHANGE 240\n1010,\n1,");
+        assert_times(&note_times(&chart), &[0.0, 0.5, 1.0]);
     }
 
     #[test]
