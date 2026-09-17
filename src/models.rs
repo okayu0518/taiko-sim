@@ -71,7 +71,6 @@ pub struct ScoreState {
     pub perfect: i32,
     pub good: i32,
     pub miss: i32,
-    pub last_judge: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

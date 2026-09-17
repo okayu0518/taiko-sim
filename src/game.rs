@@ -475,7 +475,6 @@ impl TaikoSimApp {
                 self.score.score += ROLL_HIT_SCORE;
                 self.roll_hit_count += 1;
                 self.section_rolls += 1;
-                self.score.last_judge = if roll.balloon { "Balloon" } else if roll.big { "Roll(Big)" } else { "Roll" }.to_string();
                 return true;
             }
         }
@@ -483,7 +482,6 @@ impl TaikoSimApp {
     }
 
     fn register_judge(&mut self, judge: Judge) {
-        self.score.last_judge = judge.label().to_string();
         self.score.score += judge.score();
         match judge {
             Judge::Ryo => { self.score.perfect += 1; self.section_perfect += 1; }
@@ -558,7 +556,6 @@ impl TaikoSimApp {
 
         let branch_name = if chart.has_branch { format!(" [{:?}]", cur_branch) } else { "".to_string() };
         self.draw_ui_text(&format!("{} [{} Lv{}]{}", chart.title, chart.course, chart.level, branch_name), 40.0, 56.0, 40, WHITE);
-        self.draw_ui_text(&format!("Judge: {}", self.score.last_judge), 40.0, 570.0, 36, WHITE);
         self.draw_ui_text(&format!("Score: {}", self.score.score), 320.0, 570.0, 36, WHITE);
         self.draw_ui_text(&self.score.combo.to_string(), TARGET_X - 120.0, LANE_Y - 56.0, 54, Color::from_rgba(255, 240, 170, 255));
         self.draw_ui_text("F/J: Don  D/K: Kat  Roll: drum  ESC: result", 40.0, 630.0, 30, Color::from_rgba(170, 180, 200, 255));
@@ -655,7 +652,6 @@ impl TaikoSimApp {
 
     fn adjust_timing_offset(&mut self, delta_ms: i32) {
         self.config.timing_offset_ms = (self.config.timing_offset_ms + delta_ms).clamp(-300, 300);
-        self.score.last_judge = format!("Offset {}ms", self.config.timing_offset_ms);
         if let Ok(text) = serde_json::to_string_pretty(&self.config) { let _ = std::fs::write(&self.config_path, text); }
     }
 
