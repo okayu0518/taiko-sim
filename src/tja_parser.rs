@@ -352,6 +352,7 @@ fn consume_measure(
                 kind: NoteKind::Don,
                 judged: false,
                 hit: false,
+                big: ch == '3',
                 branch,
                 scroll_speed: scroll,
             }),
@@ -360,6 +361,7 @@ fn consume_measure(
                 kind: NoteKind::Kat,
                 judged: false,
                 hit: false,
+                big: ch == '4',
                 branch,
                 scroll_speed: scroll,
             }),
@@ -390,5 +392,26 @@ fn clean_line(raw: &str) -> String {
         left.trim().to_string()
     } else {
         raw.trim().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn big_notes_are_flagged() {
+        let mut notes = Vec::new();
+        let mut rolls = Vec::new();
+        let mut open_rolls = Vec::new();
+        consume_measure("1234", &mut notes, &mut rolls, &mut open_rolls, 0.0, 120.0, 1.0, 4, 4, None);
+
+        let kinds: Vec<_> = notes.iter().map(|n| (n.kind, n.big)).collect();
+        assert_eq!(kinds, vec![
+            (NoteKind::Don, false),
+            (NoteKind::Kat, false),
+            (NoteKind::Don, true),
+            (NoteKind::Kat, true),
+        ]);
     }
 }

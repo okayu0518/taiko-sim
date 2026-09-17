@@ -28,6 +28,7 @@ pub struct Note {
     pub kind: NoteKind,
     pub judged: bool,
     pub hit: bool,
+    pub big: bool,
     pub branch: Option<Branch>,
     pub scroll_speed: f64,
 }

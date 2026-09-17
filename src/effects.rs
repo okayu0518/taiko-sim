@@ -40,9 +40,9 @@ fn ease_out(t: f32) -> f32 {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum EffectKind {
     InputFlash(NoteKind),
-    Burst(NoteKind, Judge),
+    Burst(NoteKind, Judge, f32),
     JudgeText(Judge),
-    FlyingNote(NoteKind),
+    FlyingNote(NoteKind, f32),
 }
 
 impl EffectKind {
@@ -51,7 +51,7 @@ impl EffectKind {
             EffectKind::InputFlash(_) => LIFE_INPUT_FLASH,
             EffectKind::Burst(..) => LIFE_BURST,
             EffectKind::JudgeText(_) => LIFE_JUDGE_TEXT,
-            EffectKind::FlyingNote(_) => LIFE_FLYING_NOTE,
+            EffectKind::FlyingNote(..) => LIFE_FLYING_NOTE,
         }
     }
 }
@@ -85,9 +85,10 @@ impl Effects {
         self.items.push(Effect { kind: EffectKind::InputFlash(kind), start: now });
     }
 
-    pub fn spawn_hit(&mut self, now: f64, kind: NoteKind, judge: Judge) {
-        self.items.push(Effect { kind: EffectKind::Burst(kind, judge), start: now });
-        self.items.push(Effect { kind: EffectKind::FlyingNote(kind), start: now });
+    /// `radius` is the hit note's radius, so big notes produce bigger effects.
+    pub fn spawn_hit(&mut self, now: f64, kind: NoteKind, judge: Judge, radius: f32) {
+        self.items.push(Effect { kind: EffectKind::Burst(kind, judge, radius), start: now });
+        self.items.push(Effect { kind: EffectKind::FlyingNote(kind, radius), start: now });
         self.spawn_judge_text(now, judge);
     }
 
@@ -112,12 +113,12 @@ impl Effects {
     }
 
     /// Effects drawn above notes (world camera).
-    pub fn draw_over_notes(&self, now: f64, target: Vec2, note_radius: f32) {
+    pub fn draw_over_notes(&self, now: f64, target: Vec2) {
         for e in &self.items {
             let Some(t) = e.progress(now) else { continue; };
             match e.kind {
-                EffectKind::Burst(kind, judge) => draw_burst(target, note_radius, kind, judge, t),
-                EffectKind::FlyingNote(kind) => draw_flying_note(target, note_radius, kind, t),
+                EffectKind::Burst(kind, judge, radius) => draw_burst(target, radius, kind, judge, t),
+                EffectKind::FlyingNote(kind, radius) => draw_flying_note(target, radius, kind, t),
                 _ => {}
             }
         }
@@ -181,7 +182,7 @@ mod tests {
     fn effects_expire_after_lifetime() {
         let mut fx = Effects::default();
         fx.spawn_input(0.0, NoteKind::Don);
-        fx.spawn_hit(0.0, NoteKind::Kat, Judge::Ryo);
+        fx.spawn_hit(0.0, NoteKind::Kat, Judge::Ryo, 24.0);
         assert_eq!(fx.items.len(), 4);
 
         fx.update(LIFE_INPUT_FLASH + 0.001);
@@ -205,7 +206,7 @@ mod tests {
 
     #[test]
     fn progress_is_normalized() {
-        let e = Effect { kind: EffectKind::Burst(NoteKind::Don, Judge::Ka), start: 1.0 };
+        let e = Effect { kind: EffectKind::Burst(NoteKind::Don, Judge::Ka, 24.0), start: 1.0 };
         assert_eq!(e.progress(0.9), None);
         assert_eq!(e.progress(1.0), Some(0.0));
         assert!((e.progress(1.0 + LIFE_BURST * 0.5).unwrap() - 0.5).abs() < 1e-5);

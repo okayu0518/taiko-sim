@@ -24,6 +24,7 @@ const BASE_H: f32 = 720.0;
 const TARGET_X: f32 = 290.0;
 const LANE_Y: f32 = 350.0;
 const NOTE_RADIUS: f32 = 24.0;
+const BIG_NOTE_RADIUS: f32 = 36.0;
 const JUDGE_RING_RADIUS: f32 = 26.0;
 const LANE_X: f32 = 140.0;
 const LANE_W: f32 = 1110.0;
@@ -438,8 +439,9 @@ impl TaikoSimApp {
         let note = &mut chart.notes[idx];
         note.judged = true;
         note.hit = true;
+        let radius = note_radius(note.big);
         self.register_judge(judge);
-        self.effects.spawn_hit(now, input_kind, judge);
+        self.effects.spawn_hit(now, input_kind, judge, radius);
     }
 
     fn find_nearest_note(&self, now: f64, window: f64, kind: NoteKind) -> Option<(usize, f64)> {
@@ -546,10 +548,11 @@ impl TaikoSimApp {
             if !(-SCROLL_BEHIND_SEC..=SCROLL_AHEAD_SEC).contains(&diff) { continue; }
 
             let x = TARGET_X + ((diff / SCROLL_AHEAD_SEC) as f32) * SCROLL_PIXELS * (note.scroll_speed as f32);
-            draw_circle(x, LANE_Y, NOTE_RADIUS, note_color(note.kind));
-            draw_circle_lines(x, LANE_Y, NOTE_RADIUS, 2.0, BLACK);
+            let radius = note_radius(note.big);
+            draw_circle(x, LANE_Y, radius, note_color(note.kind));
+            draw_circle_lines(x, LANE_Y, radius, 2.0, BLACK);
         }
-        self.effects.draw_over_notes(now, target, NOTE_RADIUS);
+        self.effects.draw_over_notes(now, target);
 
         set_default_camera();
         self.effects.draw_texts(now, target, |text, x, y, size, color| self.draw_ui_text(text, x, y, size, color));
@@ -699,6 +702,10 @@ impl TaikoSimApp {
             if let Ok((s, h)) = OutputStream::try_default() { self._audio_stream = Some(s); self.audio_handle = Some(h); }
         }
     }
+}
+
+fn note_radius(big: bool) -> f32 {
+    if big { BIG_NOTE_RADIUS } else { NOTE_RADIUS }
 }
 
 fn load_se_data(path: &std::path::Path) -> Option<SeData> {
