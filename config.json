@@ -1,5 +1,5 @@
 {
-  "timing_offset_ms": 180,
+  "timing_offset_ms": 170,
   "se_volume": 0.3,
   "music_volume": 0.2,
   "keybind": {
@@ -11,5 +11,6 @@
   "vsync": false,
   "font_path": null,
   "debug": true,
-  "se_enabled": false
+  "se_enabled": false,
+  "lead_in_sec": 1.0
 }
