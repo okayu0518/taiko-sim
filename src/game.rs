@@ -17,6 +17,7 @@ use crate::repository::load_song_entries;
 use crate::tja_parser::parse_tja;
 
 const SCROLL_BEHIND_SEC: f64 = 0.25;
+const SKIP_TO_RESULT_HOLD_SEC: f64 = 1.5;
 /// Pixels per beat at `#SCROLL 1`. One 4/4 measure spans roughly the judge circle to the lane end.
 const PX_PER_BEAT: f32 = 240.0;
 
@@ -35,6 +36,33 @@ enum Scene {
     SongSelect,
     Play,
     Result,
+}
+
+/// D/F/J/K handle all menu navigation, independent of the gameplay keybinds.
+#[derive(Debug, PartialEq, Eq)]
+enum MenuAction {
+    Previous,
+    Next,
+    Confirm,
+    Back,
+}
+
+fn menu_action(pressed: impl Fn(KeyCode) -> bool) -> Option<MenuAction> {
+    if pressed(KeyCode::F) {
+        Some(MenuAction::Back)
+    } else if pressed(KeyCode::J) {
+        Some(MenuAction::Confirm)
+    } else if pressed(KeyCode::D) {
+        Some(MenuAction::Previous)
+    } else if pressed(KeyCode::K) {
+        Some(MenuAction::Next)
+    } else {
+        None
+    }
+}
+
+fn skip_hold_completed(start: Option<f64>, now: f64) -> bool {
+    start.is_some_and(|start| now - start >= SKIP_TO_RESULT_HOLD_SEC)
 }
 
 #[derive(Clone)]
@@ -180,6 +208,7 @@ pub struct TaikoSimApp {
     config_path: PathBuf,
     config: AppConfig,
     keybinds: Keybinds,
+    skip_hold_started_at: Option<f64>,
 
     error_message: String,
 }
@@ -187,6 +216,8 @@ pub struct TaikoSimApp {
 impl TaikoSimApp {
     pub fn new(root_dir: PathBuf, config: AppConfig) -> Self {
         let data_dir = root_dir.join("data");
+        // Allow users to drop TJA files in a predictable place on first launch.
+        let _ = std::fs::create_dir_all(data_dir.join("songs"));
         let songs = load_song_entries(&data_dir);
         let config_path = root_dir.join("config.json");
         let keybinds = Keybinds::from_config(&config.keybind);
@@ -214,6 +245,7 @@ impl TaikoSimApp {
             config_path,
             config,
             keybinds,
+            skip_hold_started_at: None,
             error_message: String::new(),
         }
     }
@@ -232,9 +264,11 @@ impl TaikoSimApp {
             }
 
             match self.scene {
-                Scene::SongSelect => self.update_song_select().await,
+                Scene::SongSelect => {
+                    if self.update_song_select().await { break; }
+                }
                 Scene::Play => self.update_play(),
-                Scene::Result => self.update_result(),
+                Scene::Result => self.update_result().await,
             }
 
             match self.scene {
@@ -247,22 +281,49 @@ impl TaikoSimApp {
         }
     }
 
-    async fn update_song_select(&mut self) {
-        if self.songs.is_empty() { return; }
+    /// Returns true when the user wants to leave the application.
+    async fn update_song_select(&mut self) -> bool {
+        let action = menu_action(is_key_pressed);
+        if matches!(action, Some(MenuAction::Back)) {
+            return true;
+        }
 
-        if is_key_pressed(KeyCode::Up) {
-            self.selected_idx = if self.selected_idx == 0 { self.songs.len() - 1 } else { self.selected_idx - 1 };
+        if matches!(action, Some(MenuAction::Confirm)) || is_key_pressed(KeyCode::Enter) {
+            if self.songs.is_empty() {
+                // Songs may have been copied while the game was running.
+                self.songs = load_song_entries(&self.root_dir.join("data"));
+                self.selected_idx = 0;
+            } else {
+                self.start_selected_song().await;
+            }
+            return false;
         }
-        if is_key_pressed(KeyCode::Down) {
-            self.selected_idx = (self.selected_idx + 1) % self.songs.len();
+
+        if !self.songs.is_empty() {
+            if matches!(action, Some(MenuAction::Previous)) || is_key_pressed(KeyCode::Up) {
+                self.selected_idx = if self.selected_idx == 0 { self.songs.len() - 1 } else { self.selected_idx - 1 };
+            } else if matches!(action, Some(MenuAction::Next)) || is_key_pressed(KeyCode::Down) {
+                self.selected_idx = (self.selected_idx + 1) % self.songs.len();
+            }
         }
-        if is_key_pressed(KeyCode::Enter) {
-            self.start_selected_song().await;
-        }
+        false
     }
 
     fn update_play(&mut self) {
         if self.session.is_none() { return; }
+
+        // F+J is a regular double-Don hit when tapped; only a sustained
+        // hold leaves gameplay, avoiding accidental scene transitions.
+        let wall_now = get_time();
+        if is_key_down(KeyCode::F) && is_key_down(KeyCode::J) {
+            let started = *self.skip_hold_started_at.get_or_insert(wall_now);
+            if skip_hold_completed(Some(started), wall_now) {
+                self.to_result();
+                return;
+            }
+        } else {
+            self.skip_hold_started_at = None;
+        }
 
         let now = self.current_time_sec();
         let offset = self.timing_offset_sec();
@@ -290,8 +351,12 @@ impl TaikoSimApp {
         if finished { self.to_result(); }
     }
 
-    fn update_result(&mut self) {
-        if is_key_pressed(KeyCode::Enter) { self.scene = Scene::SongSelect; }
+    async fn update_result(&mut self) {
+        if is_key_pressed(KeyCode::F) || is_key_pressed(KeyCode::Enter) {
+            self.scene = Scene::SongSelect;
+        } else if is_key_pressed(KeyCode::J) {
+            self.start_selected_song().await;
+        }
     }
 
     async fn start_selected_song(&mut self) {
@@ -330,6 +395,7 @@ impl TaikoSimApp {
 
         self.current_song = Some(song);
         self.session = Some(PlaySession::new(chart));
+        self.skip_hold_started_at = None;
         self.effects.clear();
         self.start_time_sec = get_time() + lead_in;
         self.sink = Some(sink);
@@ -349,16 +415,17 @@ impl TaikoSimApp {
     fn to_result(&mut self) {
         if let Some(sink) = &self.sink { sink.stop(); }
         self.sink = None;
+        self.skip_hold_started_at = None;
         self.scene = Scene::Result;
     }
 
     fn draw_song_select(&self) {
         clear_background(Color::from_rgba(24, 26, 33, 255));
         self.draw_ui_text("Song Select", 60.0, 70.0, 56, WHITE);
-        self.draw_ui_text("UP/DOWN: select  ENTER: play  ESC: quit", 60.0, 105.0, 28, Color::from_rgba(170, 180, 200, 255));
+        self.draw_ui_text("D/K: select  J: play / refresh  F: quit", 60.0, 105.0, 28, Color::from_rgba(170, 180, 200, 255));
 
         if self.songs.is_empty() {
-            self.draw_ui_text("No songs found in data/songs", 60.0, 190.0, 34, RED);
+            self.draw_ui_text("No songs found in data/songs - add TJA/audio, then press J", 60.0, 190.0, 30, RED);
             return;
         }
 
@@ -419,7 +486,7 @@ impl TaikoSimApp {
         self.draw_ui_text(&format!("{} [{} Lv{}]{}", chart.title, chart.course, chart.level, branch_name), 40.0, 56.0, 40, WHITE);
         self.draw_ui_text(&format!("Score: {}", session.score.score), 320.0, 570.0, 36, WHITE);
         self.draw_ui_text(&session.score.combo.to_string(), TARGET_X - 120.0, LANE_Y - 56.0, 54, Color::from_rgba(255, 240, 170, 255));
-        self.draw_ui_text("F/J: Don  D/K: Kat  Roll: drum  ESC: result", 40.0, 630.0, 30, Color::from_rgba(170, 180, 200, 255));
+        self.draw_ui_text("F/J: Don  D/K: Kat  Hold F+J (1.5s): result", 40.0, 630.0, 30, Color::from_rgba(170, 180, 200, 255));
         self.draw_ui_text(&format!("Offset: {}ms ([ / ])", self.config.timing_offset_ms), 900.0, 570.0, 30, Color::from_rgba(220, 230, 255, 255));
 
         if session.active_roll(now, offset).is_some() {
@@ -486,7 +553,7 @@ impl TaikoSimApp {
         for (i, line) in stats.iter().enumerate() {
             self.draw_ui_text(line, 80.0, 200.0 + i as f32 * 56.0, 40, Color::from_rgba(230, 230, 230, 255));
         }
-        self.draw_ui_text("ENTER: song select  ESC: quit", 80.0, 640.0, 30, Color::from_rgba(170, 180, 200, 255));
+        self.draw_ui_text("F: song select  J: replay  (F again: quit)", 80.0, 640.0, 30, Color::from_rgba(170, 180, 200, 255));
     }
 
     fn draw_ui_text(&self, text: &str, x: f32, y: f32, font_size: u16, color: Color) {
@@ -606,6 +673,22 @@ mod tests {
     use super::*;
 
     const BPM120: ScrollSpeed = ScrollSpeed { bpm: 120.0, scroll: 1.0 };
+
+    #[test]
+    fn menu_controls_only_use_dfjk() {
+        assert_eq!(menu_action(|k| k == KeyCode::D), Some(MenuAction::Previous));
+        assert_eq!(menu_action(|k| k == KeyCode::K), Some(MenuAction::Next));
+        assert_eq!(menu_action(|k| k == KeyCode::J), Some(MenuAction::Confirm));
+        assert_eq!(menu_action(|k| k == KeyCode::F), Some(MenuAction::Back));
+        assert_eq!(menu_action(|k| k == KeyCode::Enter), None);
+    }
+
+    #[test]
+    fn exit_hold_requires_full_duration() {
+        assert!(!skip_hold_completed(None, 2.0));
+        assert!(!skip_hold_completed(Some(1.0), 2.49));
+        assert!(skip_hold_completed(Some(1.0), 2.5));
+    }
 
     #[test]
     fn left_right_and_mixed_same_frame_inputs_are_independent() {

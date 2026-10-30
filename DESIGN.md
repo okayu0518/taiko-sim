@@ -32,3 +32,13 @@ BGMと判定は現在別のクロックに依存するため、長時間の同�
 ## CI
 
 Ubuntuでビルド・テスト、Windows MSVCでテストとreleaseビルドを実施し、WindowsポータブルZIPをArtifactsにアップロードする。
+
+## UI操作（D/F/J/K）
+
+- 選曲: D/Kで前後の曲、Jで決定（0曲の場合は再読み込み）、Fで終了。
+- プレイ: D/KでKat、F/JでDon。F+Jの1.5秒長押しでリザルトへ。
+- リザルト: Fで選曲に戻る、Jで再プレイ。
+- ゲームプレイのキー割り当てはconfig.jsonで変更可能。メニュー操作は物理D/F/J/K固定。
+- 従来の矢印・Enter・Escapeショートカットは互換性のため残す。
+
+`data/songs/README.md` をリポジトリに保持し、譜面・音源はGit管理対象外とする。ゲーム初回起動でも `data/songs/` を作成する。
