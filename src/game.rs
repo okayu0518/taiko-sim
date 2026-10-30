@@ -240,6 +240,12 @@ pub struct TaikoSimApp {
     config_path: PathBuf,
     config: AppConfig,
     keybinds: Keybinds,
+    // Track what reached the gameplay code, separately from chart misses.
+    input_notes: u64,
+    input_rolls: u64,
+    input_ignored: u64,
+    last_frame_sec: Option<f64>,
+    worst_frame_ms: f64,
 
     error_message: String,
 }
@@ -278,6 +284,11 @@ impl TaikoSimApp {
             config_path,
             config,
             keybinds,
+            input_notes: 0,
+            input_rolls: 0,
+            input_ignored: 0,
+            last_frame_sec: None,
+            worst_frame_ms: 0.0,
             error_message: String::new(),
         }
     }
@@ -357,6 +368,12 @@ impl TaikoSimApp {
     fn update_play(&mut self, pressed: &[KeyCode]) {
         if self.session.is_none() { return; }
 
+        let frame_time = get_time();
+        if let Some(last) = self.last_frame_sec {
+            self.worst_frame_ms = self.worst_frame_ms.max((frame_time - last).max(0.0) * 1000.0);
+        }
+        self.last_frame_sec = Some(frame_time);
+
         let now = self.current_time_sec();
         let offset = self.timing_offset_sec();
         if let Some(session) = self.session.as_mut() { session.check_branch_points(now, offset); }
@@ -366,7 +383,11 @@ impl TaikoSimApp {
         for kind in self.keybinds.inputs_from_events(pressed) {
             self.play_key_se(kind);
             self.effects.spawn_input(now, kind);
-            self.try_hit(now, kind);
+            match self.try_hit(now, kind) {
+                HitOutcome::Note { .. } => self.input_notes += 1,
+                HitOutcome::Roll => self.input_rolls += 1,
+                HitOutcome::Ignored => self.input_ignored += 1,
+            }
         }
         if is_key_pressed(KeyCode::LeftBracket) { self.adjust_timing_offset(-5); }
         if is_key_pressed(KeyCode::RightBracket) { self.adjust_timing_offset(5); }
@@ -467,6 +488,11 @@ impl TaikoSimApp {
 
         self.current_song = Some(song);
         self.session = Some(PlaySession::new(chart));
+        self.input_notes = 0;
+        self.input_rolls = 0;
+        self.input_ignored = 0;
+        self.last_frame_sec = None;
+        self.worst_frame_ms = 0.0;
         self.effects.clear();
         self.start_time_sec = get_time() + lead_in;
         self.sink = Some(sink);
@@ -475,12 +501,14 @@ impl TaikoSimApp {
 
     fn current_time_sec(&self) -> f64 { get_time() - self.start_time_sec }
 
-    fn try_hit(&mut self, now: f64, input_kind: NoteKind) {
+    fn try_hit(&mut self, now: f64, input_kind: NoteKind) -> HitOutcome {
         let offset = self.timing_offset_sec();
-        let Some(session) = self.session.as_mut() else { return; };
-        if let HitOutcome::Note { judge, big } = session.hit(now, offset, input_kind) {
+        let Some(session) = self.session.as_mut() else { return HitOutcome::Ignored; };
+        let outcome = session.hit(now, offset, input_kind);
+        if let HitOutcome::Note { judge, big } = outcome {
             self.effects.spawn_hit(now, input_kind, judge, note_radius(big));
         }
+        outcome
     }
 
     fn to_result(&mut self) {
@@ -645,6 +673,14 @@ impl TaikoSimApp {
             }
             let gogo_label = if session.is_gogo_at(chart_now) { "ON" } else { "off" };
             self.draw_ui_text(&format!("Gogo: {gogo_label}"), 700.0, 208.0, 24, Color::from_rgba(170, 255, 170, 255));
+            let received = self.input_notes + self.input_rolls + self.input_ignored;
+            self.draw_ui_text(
+                &format!("Key events: {}  notes:{}  rolls:{}  ignored:{}",
+                    received, self.input_notes, self.input_rolls, self.input_ignored),
+                700.0, 240.0, 19, Color::from_rgba(170, 255, 170, 255),
+            );
+            self.draw_ui_text(&format!("Max frame: {:.1} ms", self.worst_frame_ms),
+                700.0, 266.0, 19, Color::from_rgba(170, 255, 170, 255));
         }
     }
 
