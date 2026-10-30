@@ -456,6 +456,31 @@ mod tests {
     // --- rolls ---
 
     #[test]
+    fn normal_roll_counts_both_don_and_kat_repeatedly() {
+        let mut s = PlaySession::new(chart(vec![], vec![roll(1.0, 2.0, false)], vec![]));
+        for kind in [NoteKind::Kat, NoteKind::Kat, NoteKind::Don, NoteKind::Kat] {
+            assert_eq!(s.hit(1.5, 0.0, kind), HitOutcome::Roll);
+        }
+        assert_eq!(s.roll_hit_count, 4);
+        assert_eq!(s.section.rolls, 4);
+        assert_eq!(s.score.score, 4 * ROLL_HIT_SCORE);
+    }
+
+    #[test]
+    fn dense_same_color_notes_can_be_hit_with_separate_events_in_one_frame() {
+        let mut s = session_with_notes(vec![
+            note(1.000, NoteKind::Don),
+            note(1.012, NoteKind::Don),
+            note(1.024, NoteKind::Don),
+        ]);
+        for _ in 0..3 {
+            assert!(matches!(s.hit(1.012, 0.0, NoteKind::Don), HitOutcome::Note { judge: Judge::Ryo, .. }));
+        }
+        assert_eq!(s.score.perfect, 3);
+        assert!(s.chart.notes.iter().all(|n| n.hit));
+    }
+
+    #[test]
     fn roll_hits_take_priority_over_notes() {
         let mut s = PlaySession::new(chart(vec![note(1.5, NoteKind::Don)], vec![roll(1.0, 2.0, false)], vec![]));
         assert_eq!(s.hit(1.5, 0.0, NoteKind::Kat), HitOutcome::Roll);
