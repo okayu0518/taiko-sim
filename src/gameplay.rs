@@ -199,7 +199,7 @@ impl PlaySession {
             return HitOutcome::Roll;
         }
 
-        let Some((idx, delta)) = self.find_nearest_note(now, timing_offset_sec, kind) else {
+        let Some((idx, delta)) = self.find_earliest_hittable_note(now, timing_offset_sec, kind) else {
             return HitOutcome::Ignored;
         };
         let Some(judge) = judge_hit(delta) else {
@@ -249,20 +249,28 @@ impl PlaySession {
             && now <= self.game_time(roll.end_sec, timing_offset_sec)
     }
 
-    fn find_nearest_note(&self, now: f64, timing_offset_sec: f64, kind: NoteKind) -> Option<(usize, f64)> {
-        let mut best = None;
-        let mut best_abs = f64::MAX;
+    /// Judge the earliest still-hittable note of the requested color.
+    ///
+    /// Choosing the closest note can consume a later note when two judgement
+    /// windows overlap (common in dense charts), leaving the earlier one to
+    /// expire as a miss. Branch parsing can also leave notes out of time order,
+    /// so compare note times rather than relying on vector order.
+    fn find_earliest_hittable_note(&self, now: f64, timing_offset_sec: f64, kind: NoteKind) -> Option<(usize, f64)> {
+        let mut best: Option<(usize, f64, f64)> = None;
         for (idx, note) in self.chart.notes.iter().enumerate() {
             if note.judged || note.kind != kind || !self.is_active(note.branch, note.time_sec) {
                 continue;
             }
-            let abs_delta = (now - self.game_time(note.time_sec, timing_offset_sec)).abs();
-            if abs_delta <= WINDOW_KA && abs_delta < best_abs {
-                best_abs = abs_delta;
-                best = Some(idx);
+            let note_time = self.game_time(note.time_sec, timing_offset_sec);
+            let abs_delta = (now - note_time).abs();
+            if abs_delta > WINDOW_KA {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, earliest_time, _)| note_time < *earliest_time) {
+                best = Some((idx, note_time, abs_delta));
             }
         }
-        best.map(|i| (i, best_abs))
+        best.map(|(idx, _, delta)| (idx, delta))
     }
 
     fn hit_roll_if_active(&mut self, now: f64, timing_offset_sec: f64, kind: NoteKind) -> bool {
@@ -373,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn nearest_matching_note_is_hit() {
+    fn earliest_matching_note_is_hit_without_consuming_other_colors() {
         let mut s = session_with_notes(vec![
             note(1.0, NoteKind::Don),
             note(1.05, NoteKind::Kat),
@@ -381,7 +389,45 @@ mod tests {
         ]);
         assert!(matches!(s.hit(1.04, 0.0, NoteKind::Don), HitOutcome::Note { .. }));
         let judged: Vec<_> = s.chart.notes.iter().map(|n| n.judged).collect();
-        assert_eq!(judged, vec![false, false, true]);
+        assert_eq!(judged, vec![true, false, false]);
+    }
+
+    #[test]
+    fn dense_notes_are_judged_in_chronological_order() {
+        let mut s = session_with_notes(vec![
+            note(1.000, NoteKind::Don),
+            note(1.045, NoteKind::Don),
+        ]);
+        // At 1.040 the later note is closer, but hitting it first would
+        // strand the older note inside the overlapping hit windows.
+        assert!(matches!(s.hit(1.040, 0.0, NoteKind::Don), HitOutcome::Note { judge: Judge::Ka, .. }));
+        assert!(s.chart.notes[0].hit);
+        assert!(!s.chart.notes[1].hit);
+        assert!(matches!(s.hit(1.050, 0.0, NoteKind::Don), HitOutcome::Note { judge: Judge::Ryo, .. }));
+        assert_eq!(s.score.perfect, 1);
+        assert_eq!(s.score.good, 1);
+    }
+
+    #[test]
+    fn dense_notes_are_ordered_by_time_even_if_parser_order_differs() {
+        let mut s = session_with_notes(vec![
+            note(1.050, NoteKind::Don),
+            note(1.000, NoteKind::Don),
+        ]);
+        s.hit(1.040, 0.0, NoteKind::Don);
+        assert!(!s.chart.notes[0].hit);
+        assert!(s.chart.notes[1].hit);
+    }
+
+    #[test]
+    fn earlier_note_outside_window_does_not_block_next_note() {
+        let mut s = session_with_notes(vec![
+            note(1.000, NoteKind::Don),
+            note(1.100, NoteKind::Don),
+        ]);
+        s.hit(1.090, 0.0, NoteKind::Don);
+        assert!(!s.chart.notes[0].hit);
+        assert!(s.chart.notes[1].hit);
     }
 
     #[test]
@@ -454,6 +500,31 @@ mod tests {
     }
 
     // --- rolls ---
+
+    #[test]
+    fn normal_roll_counts_both_don_and_kat_repeatedly() {
+        let mut s = PlaySession::new(chart(vec![], vec![roll(1.0, 2.0, false)], vec![]));
+        for kind in [NoteKind::Kat, NoteKind::Kat, NoteKind::Don, NoteKind::Kat] {
+            assert_eq!(s.hit(1.5, 0.0, kind), HitOutcome::Roll);
+        }
+        assert_eq!(s.roll_hit_count, 4);
+        assert_eq!(s.section.rolls, 4);
+        assert_eq!(s.score.score, 4 * ROLL_HIT_SCORE);
+    }
+
+    #[test]
+    fn dense_same_color_notes_can_be_hit_with_separate_events_in_one_frame() {
+        let mut s = session_with_notes(vec![
+            note(1.000, NoteKind::Don),
+            note(1.012, NoteKind::Don),
+            note(1.024, NoteKind::Don),
+        ]);
+        for _ in 0..3 {
+            assert!(matches!(s.hit(1.012, 0.0, NoteKind::Don), HitOutcome::Note { judge: Judge::Ryo, .. }));
+        }
+        assert_eq!(s.score.perfect, 3);
+        assert!(s.chart.notes.iter().all(|n| n.hit));
+    }
 
     #[test]
     fn roll_hits_take_priority_over_notes() {

@@ -41,7 +41,7 @@ jobs:
         run: |
           $package = 'dist/taikosim'
           New-Item -ItemType Directory -Force "$package/data/songs" | Out-Null
-          Set-Content -Path "$package/data/songs/README.txt" -Value 'Place TJA and audio in a song subdirectory.'
+          Copy-Item 'data/songs/README.md' "$package/data/songs/README.md"
           Copy-Item 'target/x86_64-pc-windows-msvc/release/taikosim.exe' "$package/taikosim.exe"
           Copy-Item 'assets' "$package/assets" -Recurse
           Copy-Item 'config.example.json' "$package/config.json"

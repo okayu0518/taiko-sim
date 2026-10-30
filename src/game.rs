@@ -14,7 +14,7 @@ use crate::effects::{draw_gogo_flame, draw_gogo_lane, gogo_intensity, note_color
 use crate::gameplay::{HitOutcome, PlaySession};
 use crate::judge::Judge;
 use crate::repository::load_song_entries;
-use crate::tja_parser::parse_tja;
+use crate::tja_parser::{list_courses, parse_tja, CourseOption};
 
 const SCROLL_BEHIND_SEC: f64 = 0.25;
 /// Pixels per beat at `#SCROLL 1`. One 4/4 measure spans roughly the judge circle to the lane end.
@@ -30,11 +30,73 @@ const JUDGE_RING_RADIUS: f32 = 26.0;
 const LANE_X: f32 = 140.0;
 const LANE_W: f32 = 1110.0;
 const LANE_H: f32 = 120.0;
+const SONGS_PER_PAGE: usize = 10;
+const MENU_LIST_TOP: f32 = 171.0;
+const MENU_ROW_SPACING: f32 = 44.0;
+
+fn song_page_start(selected: usize) -> usize {
+    (selected / SONGS_PER_PAGE) * SONGS_PER_PAGE
+}
+
+fn balloon_position(start_diff: f64, end_diff: f64, speed: ScrollSpeed) -> f32 {
+    if start_diff <= 0.0 && end_diff >= 0.0 {
+        TARGET_X
+    } else {
+        scroll_x(start_diff, speed)
+    }
+}
 
 enum Scene {
     SongSelect,
+    DifficultySelect,
     Play,
     Result,
+}
+
+/// D/F/J/K handle all menu navigation, independent of the gameplay keybinds.
+#[derive(Debug, PartialEq, Eq)]
+enum MenuAction {
+    Previous,
+    Next,
+    Confirm,
+    Back,
+}
+
+fn menu_action(pressed: impl Fn(KeyCode) -> bool) -> Option<MenuAction> {
+    if pressed(KeyCode::F) {
+        Some(MenuAction::Back)
+    } else if pressed(KeyCode::J) {
+        Some(MenuAction::Confirm)
+    } else if pressed(KeyCode::D) {
+        Some(MenuAction::Previous)
+    } else if pressed(KeyCode::K) {
+        Some(MenuAction::Next)
+    } else {
+        None
+    }
+}
+
+/// Capture individual non-repeat keydown events in arrival order, including
+/// repeated presses of the same key between two rendered frames.
+#[derive(Default)]
+struct DrumInputEvents {
+    pressed: Vec<KeyCode>,
+}
+
+impl macroquad::miniquad::EventHandler for DrumInputEvents {
+    fn update(&mut self) {}
+    fn draw(&mut self) {}
+
+    fn key_down_event(
+        &mut self,
+        key: KeyCode,
+        _mods: macroquad::miniquad::KeyMods,
+        repeat: bool,
+    ) {
+        if !repeat {
+            self.pressed.push(key);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -140,22 +202,18 @@ impl Keybinds {
         }
     }
 
-    /// Preserve separate hits for each bound key, including simultaneous hits.
-    /// Duplicate mappings are processed once per physical key.
-    fn pressed_inputs_with(&self, pressed: impl Fn(KeyCode) -> bool) -> Vec<NoteKind> {
-        let bindings = [
-            (self.don_left, NoteKind::Don),
-            (self.don_right, NoteKind::Don),
-            (self.kat_left, NoteKind::Kat),
-            (self.kat_right, NoteKind::Kat),
-        ];
-        bindings.iter().enumerate().filter_map(|(i, &(key, kind))| {
-            if bindings[..i].iter().any(|&(previous, _)| previous == key) {
-                None
-            } else {
-                pressed(key).then_some(kind)
-            }
-        }).collect()
+    fn kind_for_key(&self, key: KeyCode) -> Option<NoteKind> {
+        if key == self.don_left || key == self.don_right {
+            Some(NoteKind::Don)
+        } else if key == self.kat_left || key == self.kat_right {
+            Some(NoteKind::Kat)
+        } else {
+            None
+        }
+    }
+
+    fn inputs_from_events(&self, events: &[KeyCode]) -> Vec<NoteKind> {
+        events.iter().filter_map(|&key| self.kind_for_key(key)).collect()
     }
 }
 
@@ -163,6 +221,8 @@ pub struct TaikoSimApp {
     root_dir: PathBuf,
     songs: Vec<SongEntry>,
     selected_idx: usize,
+    courses: Vec<CourseOption>,
+    selected_course_idx: usize,
     scene: Scene,
 
     current_song: Option<SongEntry>,
@@ -180,6 +240,12 @@ pub struct TaikoSimApp {
     config_path: PathBuf,
     config: AppConfig,
     keybinds: Keybinds,
+    // Track what reached the gameplay code, separately from chart misses.
+    input_notes: u64,
+    input_rolls: u64,
+    input_ignored: u64,
+    last_frame_sec: Option<f64>,
+    worst_frame_ms: f64,
 
     error_message: String,
 }
@@ -187,6 +253,8 @@ pub struct TaikoSimApp {
 impl TaikoSimApp {
     pub fn new(root_dir: PathBuf, config: AppConfig) -> Self {
         let data_dir = root_dir.join("data");
+        // Allow users to drop TJA files in a predictable place on first launch.
+        let _ = std::fs::create_dir_all(data_dir.join("songs"));
         let songs = load_song_entries(&data_dir);
         let config_path = root_dir.join("config.json");
         let keybinds = Keybinds::from_config(&config.keybind);
@@ -199,6 +267,8 @@ impl TaikoSimApp {
             root_dir,
             songs,
             selected_idx: 0,
+            courses: Vec::new(),
+            selected_course_idx: 0,
             scene: Scene::SongSelect,
             current_song: None,
             session: None,
@@ -214,6 +284,11 @@ impl TaikoSimApp {
             config_path,
             config,
             keybinds,
+            input_notes: 0,
+            input_rolls: 0,
+            input_ignored: 0,
+            last_frame_sec: None,
+            worst_frame_ms: 0.0,
             error_message: String::new(),
         }
     }
@@ -222,23 +297,38 @@ impl TaikoSimApp {
         self.try_load_ui_font().await;
         self.try_load_se();
 
+        // Unlike is_key_pressed (a HashSet per frame), this captures every
+        // physical press event separately and preserves the arrival order.
+        let input_subscriber = macroquad::input::utils::register_input_subscriber();
+        let mut drum_events = DrumInputEvents::default();
+
         loop {
+            drum_events.pressed.clear();
+            macroquad::input::utils::repeat_all_miniquad_input(&mut drum_events, input_subscriber);
+
             if is_key_pressed(KeyCode::Escape) {
                 match self.scene {
-                    Scene::SongSelect => break,
+                    Scene::SongSelect | Scene::Result => break,
+                    Scene::DifficultySelect => self.scene = Scene::SongSelect,
                     Scene::Play => self.to_result(),
-                    Scene::Result => break,
                 }
+                // Do not let an Escape key affect the new scene in this frame.
+                next_frame().await;
+                continue;
             }
 
             match self.scene {
-                Scene::SongSelect => self.update_song_select().await,
-                Scene::Play => self.update_play(),
-                Scene::Result => self.update_result(),
+                Scene::SongSelect => {
+                    if self.update_song_select().await { break; }
+                }
+                Scene::DifficultySelect => self.update_difficulty_select().await,
+                Scene::Play => self.update_play(&drum_events.pressed),
+                Scene::Result => self.update_result().await,
             }
 
             match self.scene {
                 Scene::SongSelect => self.draw_song_select(),
+                Scene::DifficultySelect => self.draw_difficulty_select(),
                 Scene::Play => self.draw_play(),
                 Scene::Result => self.draw_result(),
             }
@@ -247,22 +337,42 @@ impl TaikoSimApp {
         }
     }
 
-    async fn update_song_select(&mut self) {
-        if self.songs.is_empty() { return; }
+    /// Returns true when the user wants to leave the application.
+    async fn update_song_select(&mut self) -> bool {
+        let action = menu_action(is_key_pressed);
+        if matches!(action, Some(MenuAction::Back)) {
+            return true;
+        }
 
-        if is_key_pressed(KeyCode::Up) {
-            self.selected_idx = if self.selected_idx == 0 { self.songs.len() - 1 } else { self.selected_idx - 1 };
+        if matches!(action, Some(MenuAction::Confirm)) || is_key_pressed(KeyCode::Enter) {
+            if self.songs.is_empty() {
+                // Songs may have been copied while the game was running.
+                self.songs = load_song_entries(&self.root_dir.join("data"));
+                self.selected_idx = 0;
+            } else {
+                self.open_difficulty_select();
+            }
+            return false;
         }
-        if is_key_pressed(KeyCode::Down) {
-            self.selected_idx = (self.selected_idx + 1) % self.songs.len();
+
+        if !self.songs.is_empty() {
+            if matches!(action, Some(MenuAction::Previous)) || is_key_pressed(KeyCode::Up) {
+                self.selected_idx = if self.selected_idx == 0 { self.songs.len() - 1 } else { self.selected_idx - 1 };
+            } else if matches!(action, Some(MenuAction::Next)) || is_key_pressed(KeyCode::Down) {
+                self.selected_idx = (self.selected_idx + 1) % self.songs.len();
+            }
         }
-        if is_key_pressed(KeyCode::Enter) {
-            self.start_selected_song().await;
-        }
+        false
     }
 
-    fn update_play(&mut self) {
+    fn update_play(&mut self, pressed: &[KeyCode]) {
         if self.session.is_none() { return; }
+
+        let frame_time = get_time();
+        if let Some(last) = self.last_frame_sec {
+            self.worst_frame_ms = self.worst_frame_ms.max((frame_time - last).max(0.0) * 1000.0);
+        }
+        self.last_frame_sec = Some(frame_time);
 
         let now = self.current_time_sec();
         let offset = self.timing_offset_sec();
@@ -270,10 +380,14 @@ impl TaikoSimApp {
 
         self.effects.update(now);
 
-        for kind in self.keybinds.pressed_inputs_with(is_key_pressed) {
+        for kind in self.keybinds.inputs_from_events(pressed) {
             self.play_key_se(kind);
             self.effects.spawn_input(now, kind);
-            self.try_hit(now, kind);
+            match self.try_hit(now, kind) {
+                HitOutcome::Note { .. } => self.input_notes += 1,
+                HitOutcome::Roll => self.input_rolls += 1,
+                HitOutcome::Ignored => self.input_ignored += 1,
+            }
         }
         if is_key_pressed(KeyCode::LeftBracket) { self.adjust_timing_offset(-5); }
         if is_key_pressed(KeyCode::RightBracket) { self.adjust_timing_offset(5); }
@@ -290,16 +404,60 @@ impl TaikoSimApp {
         if finished { self.to_result(); }
     }
 
-    fn update_result(&mut self) {
-        if is_key_pressed(KeyCode::Enter) { self.scene = Scene::SongSelect; }
+    async fn update_result(&mut self) {
+        if is_key_pressed(KeyCode::F) || is_key_pressed(KeyCode::Enter) {
+            self.scene = Scene::SongSelect;
+        } else if is_key_pressed(KeyCode::J) {
+            self.start_selected_song().await;
+        }
+    }
+
+    fn open_difficulty_select(&mut self) {
+        self.error_message.clear();
+        let Some(song) = self.songs.get(self.selected_idx) else { return; };
+        match list_courses(&song.tja_path) {
+            Ok(courses) => {
+                self.selected_course_idx = courses.iter().position(|c| c.name == "Oni").unwrap_or(0);
+                self.courses = courses;
+                self.scene = Scene::DifficultySelect;
+            }
+            Err(e) => self.error_message = format!("難易度読み込み失敗: {e}"),
+        }
+    }
+
+    async fn update_difficulty_select(&mut self) {
+        match menu_action(is_key_pressed) {
+            Some(MenuAction::Back) => self.scene = Scene::SongSelect,
+            Some(MenuAction::Confirm) => self.start_selected_song().await,
+            Some(MenuAction::Previous) => {
+                if !self.courses.is_empty() {
+                    self.selected_course_idx = if self.selected_course_idx == 0 {
+                        self.courses.len() - 1
+                    } else {
+                        self.selected_course_idx - 1
+                    };
+                }
+            }
+            Some(MenuAction::Next) => {
+                if !self.courses.is_empty() {
+                    self.selected_course_idx = (self.selected_course_idx + 1) % self.courses.len();
+                }
+            }
+            None => {}
+        }
     }
 
     async fn start_selected_song(&mut self) {
         self.error_message.clear();
         let Some(song) = self.songs.get(self.selected_idx).cloned() else { return; };
 
+        let Some(course) = self.courses.get(self.selected_course_idx) else {
+            self.error_message = "難易度が選択されていません".to_owned();
+            return;
+        };
+        let course_id = course.id.clone();
         self.ensure_bgm_output();
-        let (chart, wave) = match parse_tja(&song.tja_path, Some("Oni")) {
+        let (chart, wave) = match parse_tja(&song.tja_path, Some(&course_id)) {
             Ok(v) => v,
             Err(e) => { self.error_message = format!("譜面読み込み失敗: {e}"); return; }
         };
@@ -330,6 +488,11 @@ impl TaikoSimApp {
 
         self.current_song = Some(song);
         self.session = Some(PlaySession::new(chart));
+        self.input_notes = 0;
+        self.input_rolls = 0;
+        self.input_ignored = 0;
+        self.last_frame_sec = None;
+        self.worst_frame_ms = 0.0;
         self.effects.clear();
         self.start_time_sec = get_time() + lead_in;
         self.sink = Some(sink);
@@ -338,12 +501,14 @@ impl TaikoSimApp {
 
     fn current_time_sec(&self) -> f64 { get_time() - self.start_time_sec }
 
-    fn try_hit(&mut self, now: f64, input_kind: NoteKind) {
+    fn try_hit(&mut self, now: f64, input_kind: NoteKind) -> HitOutcome {
         let offset = self.timing_offset_sec();
-        let Some(session) = self.session.as_mut() else { return; };
-        if let HitOutcome::Note { judge, big } = session.hit(now, offset, input_kind) {
+        let Some(session) = self.session.as_mut() else { return HitOutcome::Ignored; };
+        let outcome = session.hit(now, offset, input_kind);
+        if let HitOutcome::Note { judge, big } = outcome {
             self.effects.spawn_hit(now, input_kind, judge, note_radius(big));
         }
+        outcome
     }
 
     fn to_result(&mut self) {
@@ -353,24 +518,85 @@ impl TaikoSimApp {
     }
 
     fn draw_song_select(&self) {
-        clear_background(Color::from_rgba(24, 26, 33, 255));
-        self.draw_ui_text("Song Select", 60.0, 70.0, 56, WHITE);
-        self.draw_ui_text("UP/DOWN: select  ENTER: play  ESC: quit", 60.0, 105.0, 28, Color::from_rgba(170, 180, 200, 255));
+        self.draw_menu_header("SONG SELECT", "D/K: change song   J: difficulty   F: quit");
 
         if self.songs.is_empty() {
-            self.draw_ui_text("No songs found in data/songs", 60.0, 190.0, 34, RED);
+            self.draw_ui_text("No songs found", 100.0, 250.0, 34, WHITE);
+            self.draw_ui_text("Add TJA and audio to data/songs/<song>/", 100.0, 304.0, 24, Color::from_rgba(165, 183, 210, 255));
+            self.draw_ui_text("Press J to refresh the song list", 100.0, 344.0, 24, Color::from_rgba(255, 207, 118, 255));
             return;
         }
 
-        for (idx, song) in self.songs.iter().enumerate() {
+        let start = song_page_start(self.selected_idx);
+        let end = (start + SONGS_PER_PAGE).min(self.songs.len());
+        for (row, idx) in (start..end).enumerate() {
+            let song = &self.songs[idx];
             let selected = idx == self.selected_idx;
-            let color = if selected { Color::from_rgba(255, 230, 140, 255) } else { Color::from_rgba(230, 230, 230, 255) };
-            let label = format!("{}{} ({})", if selected { "> " } else { "  " }, song.title, song.song_id);
-            self.draw_ui_text(&label, 80.0, 170.0 + idx as f32 * 44.0, 38, color);
+            let baseline = MENU_LIST_TOP + row as f32 * MENU_ROW_SPACING + 29.0;
+            let y = baseline - 30.0;
+            self.draw_menu_row(y, selected);
+
+            let number_color = if selected {
+                Color::from_rgba(255, 216, 136, 255)
+            } else {
+                Color::from_rgba(117, 139, 170, 255)
+            };
+            self.draw_ui_text(&format!("{:02}", idx + 1), 98.0, baseline, 21, number_color);
+            self.draw_ui_fitted_text(
+                &song.title, 161.0, baseline, 27, 840.0,
+                if selected { WHITE } else { Color::from_rgba(203, 215, 235, 255) },
+            );
+            if selected {
+                self.draw_ui_text("SELECTED", 1024.0, baseline, 18, Color::from_rgba(255, 207, 118, 255));
+            }
         }
 
+        let page = start / SONGS_PER_PAGE + 1;
+        let pages = self.songs.len().div_ceil(SONGS_PER_PAGE);
+        self.draw_menu_footer(&format!(
+            "{} songs    Page {}/{}    Selected {}/{}",
+            self.songs.len(), page, pages, self.selected_idx + 1, self.songs.len()
+        ));
+
         if !self.error_message.is_empty() {
-            self.draw_ui_text(&self.error_message, 60.0, screen_height() - 40.0, 30, Color::from_rgba(255, 120, 120, 255));
+            self.draw_ui_fitted_text(
+                &self.error_message, 77.0, 622.0, 21, 1100.0,
+                Color::from_rgba(255, 141, 141, 255)
+            );
+        }
+    }
+
+    fn draw_difficulty_select(&self) {
+        self.draw_menu_header("DIFFICULTY", "D/K: choose difficulty   J: play   F: back");
+
+        if let Some(song) = self.songs.get(self.selected_idx) {
+            self.draw_ui_fitted_text(
+                &song.title, 93.0, 190.0, 29, 1060.0,
+                Color::from_rgba(224, 232, 248, 255),
+            );
+        }
+
+        for (i, course) in self.courses.iter().enumerate() {
+            let selected = i == self.selected_course_idx;
+            let baseline = 252.0 + 63.0 * i as f32;
+            self.draw_menu_row(baseline - 34.0, selected);
+            self.draw_ui_fitted_text(
+                &course.name, 119.0, baseline, 31, 720.0,
+                if selected { WHITE } else { Color::from_rgba(194, 210, 230, 255) },
+            );
+            self.draw_ui_text(
+                &format!("Lv {}", course.level), 970.0, baseline, 27,
+                if selected { Color::from_rgba(255, 210, 125, 255) }
+                else { Color::from_rgba(143, 163, 193, 255) },
+            );
+        }
+        self.draw_menu_footer("Only difficulties present in this TJA file are shown");
+
+        if !self.error_message.is_empty() {
+            self.draw_ui_fitted_text(
+                &self.error_message, 77.0, 621.0, 21, 1100.0,
+                Color::from_rgba(255, 141, 141, 255)
+            );
         }
     }
 
@@ -416,14 +642,20 @@ impl TaikoSimApp {
         self.effects.draw_texts(now, target, |text, x, y, size, color| self.draw_ui_text(text, x, y, size, color));
 
         let branch_name = if chart.has_branch { format!(" [{:?}]", cur_branch) } else { "".to_string() };
-        self.draw_ui_text(&format!("{} [{} Lv{}]{}", chart.title, chart.course, chart.level, branch_name), 40.0, 56.0, 40, WHITE);
+        let course_name = self.courses.get(self.selected_course_idx)
+            .map(|c| c.name.as_str())
+            .unwrap_or(chart.course.as_str());
+        self.draw_ui_fitted_text(&format!("{} [{} Lv{}]{}", chart.title, course_name, chart.level, branch_name), 40.0, 56.0, 35, 930.0, WHITE);
         self.draw_ui_text(&format!("Score: {}", session.score.score), 320.0, 570.0, 36, WHITE);
         self.draw_ui_text(&session.score.combo.to_string(), TARGET_X - 120.0, LANE_Y - 56.0, 54, Color::from_rgba(255, 240, 170, 255));
-        self.draw_ui_text("F/J: Don  D/K: Kat  Roll: drum  ESC: result", 40.0, 630.0, 30, Color::from_rgba(170, 180, 200, 255));
+        self.draw_ui_text("F/J: Don  D/K: Kat  ESC: result", 40.0, 630.0, 30, Color::from_rgba(170, 180, 200, 255));
         self.draw_ui_text(&format!("Offset: {}ms ([ / ])", self.config.timing_offset_ms), 900.0, 570.0, 30, Color::from_rgba(220, 230, 255, 255));
 
-        if session.active_roll(now, offset).is_some() {
-            self.draw_ui_text(&format!("連打: {}", session.roll_hit_count), TARGET_X - 55.0, LANE_Y - 72.0, 30, Color::from_rgba(255, 245, 180, 255));
+        if let Some(roll) = session.active_roll(now, offset) {
+            let label = if roll.balloon { "BALLOON" } else { "ROLL" };
+            self.draw_ui_text(&format!("{}  {}", label, session.roll_hit_count),
+                TARGET_X - 110.0, LANE_Y - 82.0, 25,
+                Color::from_rgba(255, 232, 161, 255));
         }
 
         if self.config.debug {
@@ -441,6 +673,14 @@ impl TaikoSimApp {
             }
             let gogo_label = if session.is_gogo_at(chart_now) { "ON" } else { "off" };
             self.draw_ui_text(&format!("Gogo: {gogo_label}"), 700.0, 208.0, 24, Color::from_rgba(170, 255, 170, 255));
+            let received = self.input_notes + self.input_rolls + self.input_ignored;
+            self.draw_ui_text(
+                &format!("Key events: {}  notes:{}  rolls:{}  ignored:{}",
+                    received, self.input_notes, self.input_rolls, self.input_ignored),
+                700.0, 240.0, 19, Color::from_rgba(170, 255, 170, 255),
+            );
+            self.draw_ui_text(&format!("Max frame: {:.1} ms", self.worst_frame_ms),
+                700.0, 266.0, 19, Color::from_rgba(170, 255, 170, 255));
         }
     }
 
@@ -454,39 +694,143 @@ impl TaikoSimApp {
 
             let start_x = scroll_x(start_diff, roll.head_speed);
             let end_x = scroll_x(end_diff, roll.tail_speed);
-            if start_x.max(end_x) < LANE_X || start_x.min(end_x) > LANE_X + LANE_W { continue; }
             let body_left = start_x.min(end_x).max(LANE_X);
             let body_right = start_x.max(end_x).min(LANE_X + LANE_W);
 
-            let base_color = if roll.balloon { Color::from_rgba(255, 200, 80, 255) } else if roll.big { Color::from_rgba(255, 160, 60, 255) } else { Color::from_rgba(255, 210, 90, 255) };
+            if roll.balloon {
+                // Balloons are a separate note type, not yellow drumroll bars.
+                let x = balloon_position(start_diff, end_diff, roll.head_speed);
+                let active = start_diff <= 0.0 && end_diff >= 0.0;
+                if active {
+                    // Show the remaining duration as a thin timer tail.
+                    let tail_right = end_x.clamp(TARGET_X, LANE_X + LANE_W);
+                    draw_rectangle(
+                        TARGET_X, LANE_Y + 48.0,
+                        (tail_right - TARGET_X).max(0.0), 5.0,
+                        Color::from_rgba(255, 185, 75, 190),
+                    );
+                } else if body_right > body_left {
+                    draw_rectangle(
+                        body_left, LANE_Y + 48.0, body_right - body_left, 5.0,
+                        Color::from_rgba(255, 185, 75, 120),
+                    );
+                }
+                if is_x_visible(x, 60.0) {
+                    draw_balloon(x, LANE_Y, active, now);
+                }
+                continue;
+            }
 
-            if body_right > body_left { draw_rectangle(body_left, LANE_Y - 12.0, body_right - body_left, 24.0, base_color); }
-            draw_circle(start_x, LANE_Y, 16.0, base_color);
-            draw_circle(end_x, LANE_Y, 16.0, base_color);
-            draw_circle_lines(start_x, LANE_Y, 16.0, 2.0, BLACK);
-            draw_circle_lines(end_x, LANE_Y, 16.0, 2.0, BLACK);
+            if start_x.max(end_x) < LANE_X || start_x.min(end_x) > LANE_X + LANE_W { continue; }
+
+            let color = if roll.big {
+                Color::from_rgba(255, 152, 60, 255)
+            } else {
+                Color::from_rgba(255, 207, 85, 255)
+            };
+            if body_right > body_left {
+                draw_rectangle(body_left, LANE_Y - 12.0, body_right - body_left, 24.0, color);
+                draw_rectangle(body_left, LANE_Y - 10.0, body_right - body_left, 6.0,
+                    Color::from_rgba(255, 243, 179, 170));
+            }
+            draw_circle(start_x, LANE_Y, if roll.big { 22.0 } else { 17.0 }, color);
+            draw_circle(end_x, LANE_Y, 16.0, color);
+            draw_circle_lines(start_x, LANE_Y, if roll.big { 22.0 } else { 17.0 }, 2.5,
+                Color::from_rgba(117, 68, 33, 255));
+            draw_circle_lines(end_x, LANE_Y, 16.0, 2.5, Color::from_rgba(117, 68, 33, 255));
         }
     }
 
     fn draw_result(&self) {
-        clear_background(Color::from_rgba(24, 26, 33, 255));
-        self.draw_ui_text("Result", 60.0, 70.0, 56, WHITE);
-        let song_name = self.current_song.as_ref().map(|s| s.title.clone()).unwrap_or_else(|| "Unknown".to_string());
-        self.draw_ui_text(&song_name, 80.0, 130.0, 36, Color::from_rgba(200, 220, 255, 255));
+        self.draw_menu_header("RESULT", "F: song select   J: replay   ESC: quit");
+        let song_name = self.current_song.as_ref()
+            .map(|s| s.title.as_str()).unwrap_or("Unknown");
+        let course = self.courses.get(self.selected_course_idx)
+            .map(|c| c.name.as_str()).unwrap_or("Unknown");
+        self.draw_ui_fitted_text(song_name, 92.0, 205.0, 34, 955.0, WHITE);
+        self.draw_ui_text(&format!("Difficulty: {}", course), 95.0, 245.0, 23,
+            Color::from_rgba(169, 191, 222, 255));
 
         let default_score = ScoreState::default();
         let score = self.session.as_ref().map_or(&default_score, |s| &s.score);
+        self.draw_ui_text("SCORE", 96.0, 316.0, 20,
+            Color::from_rgba(155, 175, 200, 255));
+        self.draw_ui_text(&score.score.to_string(), 95.0, 382.0, 56,
+            Color::from_rgba(255, 212, 132, 255));
+
         let stats = [
-            format!("Score: {}", score.score),
-            format!("Max Combo: {}", score.max_combo),
-            format!("良: {}", score.perfect),
-            format!("可: {}", score.good),
-            format!("不可: {}", score.miss),
+            ("MAX COMBO", score.max_combo),
+            ("RYO", score.perfect),
+            ("KA", score.good),
+            ("MISS", score.miss),
         ];
-        for (i, line) in stats.iter().enumerate() {
-            self.draw_ui_text(line, 80.0, 200.0 + i as f32 * 56.0, 40, Color::from_rgba(230, 230, 230, 255));
+        for (i, (name, value)) in stats.iter().enumerate() {
+            let x = 93.0 + i as f32 * 275.0;
+            self.draw_ui_rect(x, 436.0, 250.0, 100.0, Color::from_rgba(39, 54, 75, 255));
+            self.draw_ui_text(name, x + 17.0, 473.0, 20,
+                Color::from_rgba(153, 177, 207, 255));
+            self.draw_ui_text(&value.to_string(), x + 17.0, 515.0, 33, WHITE);
         }
-        self.draw_ui_text("ENTER: song select  ESC: quit", 80.0, 640.0, 30, Color::from_rgba(170, 180, 200, 255));
+        self.draw_menu_footer("Press J to retry the selected difficulty");
+    }
+
+    fn draw_menu_header(&self, title: &str, controls: &str) {
+        clear_background(Color::from_rgba(17, 23, 35, 255));
+        self.draw_ui_rect(0.0, 0.0, BASE_W, 7.0, Color::from_rgba(255, 178, 98, 255));
+        self.draw_ui_rect(60.0, 139.0, 1160.0, 476.0, Color::from_rgba(29, 39, 56, 255));
+        self.draw_ui_rect(60.0, 139.0, 5.0, 476.0, Color::from_rgba(255, 178, 98, 255));
+        self.draw_ui_text(title, 68.0, 69.0, 44, WHITE);
+        self.draw_ui_fitted_text(controls, 71.0, 108.0, 20, 1120.0,
+            Color::from_rgba(169, 190, 216, 255));
+    }
+
+    fn draw_menu_row(&self, top: f32, selected: bool) {
+        self.draw_ui_rect(
+            84.0, top, 1109.0, 40.0,
+            if selected { Color::from_rgba(69, 81, 103, 255) }
+            else { Color::from_rgba(36, 48, 67, 255) },
+        );
+        if selected {
+            self.draw_ui_rect(84.0, top, 5.0, 40.0,
+                Color::from_rgba(255, 195, 105, 255));
+        }
+    }
+
+    fn draw_menu_footer(&self, text: &str) {
+        self.draw_ui_fitted_text(text, 81.0, 675.0, 19, 1118.0,
+            Color::from_rgba(158, 180, 207, 255));
+    }
+
+    fn draw_ui_rect(&self, x: f32, y: f32, w: f32, h: f32, color: Color) {
+        let sx = screen_width() / BASE_W;
+        let sy = screen_height() / BASE_H;
+        draw_rectangle(x * sx, y * sy, w * sx, h * sy, color);
+    }
+
+    /// Limit the rendered width to a measured pixel budget, preserving Unicode
+    /// character boundaries when inserting an ellipsis.
+    fn draw_ui_fitted_text(
+        &self, text: &str, x: f32, y: f32, font_size: u16,
+        max_width: f32, color: Color,
+    ) {
+        let sx = screen_width() / BASE_W;
+        let sy = screen_height() / BASE_H;
+        let scaled_size = ((font_size as f32 * sy).round() as u16).max(1);
+        let font = self.ui_font.as_ref();
+        let fits = |value: &str| measure_text(value, font, scaled_size, 1.0).width <= max_width * sx;
+        if fits(text) {
+            self.draw_ui_text(text, x, y, font_size, color);
+            return;
+        }
+        let mut clipped = text.to_owned();
+        while !clipped.is_empty() {
+            clipped.pop();
+            let candidate = format!("{}...", clipped);
+            if fits(&candidate) {
+                self.draw_ui_text(&candidate, x, y, font_size, color);
+                return;
+            }
+        }
     }
 
     fn draw_ui_text(&self, text: &str, x: f32, y: f32, font_size: u16, color: Color) {
@@ -553,6 +897,30 @@ impl TaikoSimApp {
     }
 }
 
+/// Balloon/firmament-style note. The shape stays at the hit target while active.
+fn draw_balloon(x: f32, y: f32, active: bool, time: f64) {
+    let pulse = if active { ((time * 13.0).sin() as f32 + 1.0) * 2.0 } else { 0.0 };
+    let w = 47.0 + pulse;
+    let h = 36.0 + pulse * 0.7;
+    let outline = Color::from_rgba(108, 56, 46, 255);
+    // Shadow and the tied knot are separate from the oval so the silhouette
+    // can never be mistaken for an ordinary long roll.
+    draw_ellipse(x + 2.5, y + 3.0, w + 3.0, h + 3.0, 0.0,
+        Color::from_rgba(66, 44, 51, 180));
+    draw_ellipse(x, y, w, h, 0.0, Color::from_rgba(255, 150, 78, 255));
+    draw_ellipse(x - 6.0, y - 7.0, w - 9.0, h - 8.0, 0.0,
+        Color::from_rgba(255, 193, 100, 255));
+    draw_ellipse_lines(x, y, w, h, 0.0, 3.0, outline);
+    draw_ellipse(x - 16.0, y - 15.0, 13.0, 7.0, -25.0,
+        Color::from_rgba(255, 246, 207, 180));
+    draw_triangle(
+        vec2(x - 7.0, y + h - 3.0), vec2(x + 7.0, y + h - 3.0),
+        vec2(x, y + h + 11.0), Color::from_rgba(255, 164, 88, 255),
+    );
+    draw_line(x, y + h + 10.0, x + 6.0, y + h + 19.0, 2.0,
+        Color::from_rgba(255, 217, 143, 255));
+}
+
 /// Horizontal position of an object `diff_sec` seconds before its hit time.
 fn scroll_x(diff_sec: f64, speed: ScrollSpeed) -> f32 {
     TARGET_X + (diff_sec * speed.beats_per_sec()) as f32 * PX_PER_BEAT
@@ -608,16 +976,41 @@ mod tests {
     const BPM120: ScrollSpeed = ScrollSpeed { bpm: 120.0, scroll: 1.0 };
 
     #[test]
+    fn menu_controls_only_use_dfjk() {
+        assert_eq!(menu_action(|k| k == KeyCode::D), Some(MenuAction::Previous));
+        assert_eq!(menu_action(|k| k == KeyCode::K), Some(MenuAction::Next));
+        assert_eq!(menu_action(|k| k == KeyCode::J), Some(MenuAction::Confirm));
+        assert_eq!(menu_action(|k| k == KeyCode::F), Some(MenuAction::Back));
+        assert_eq!(menu_action(|k| k == KeyCode::Enter), None);
+    }
+
+    #[test]
+    fn key_events_preserve_repeated_taps_in_one_frame() {
+        let keys = Keybinds::from_config(&KeybindConfig::default());
+        let events = [KeyCode::F, KeyCode::F, KeyCode::D, KeyCode::K, KeyCode::J];
+        assert_eq!(keys.inputs_from_events(&events), vec![
+            NoteKind::Don, NoteKind::Don, NoteKind::Kat,
+            NoteKind::Kat, NoteKind::Don,
+        ]);
+    }
+
+    #[test]
+    fn auto_repeat_events_are_not_counted_as_drums() {
+        let mut events = DrumInputEvents::default();
+        macroquad::miniquad::EventHandler::key_down_event(
+            &mut events, KeyCode::F, macroquad::miniquad::KeyMods::default(), false
+        );
+        macroquad::miniquad::EventHandler::key_down_event(
+            &mut events, KeyCode::F, macroquad::miniquad::KeyMods::default(), true
+        );
+        assert_eq!(events.pressed, vec![KeyCode::F]);
+    }
+
+    #[test]
     fn left_right_and_mixed_same_frame_inputs_are_independent() {
         let keys = Keybinds::from_config(&KeybindConfig::default());
-        assert_eq!(
-            keys.pressed_inputs_with(|key| key == KeyCode::F || key == KeyCode::J),
-            vec![NoteKind::Don, NoteKind::Don]
-        );
-        assert_eq!(
-            keys.pressed_inputs_with(|key| key == KeyCode::F || key == KeyCode::K),
-            vec![NoteKind::Don, NoteKind::Kat]
-        );
+        assert_eq!(keys.inputs_from_events(&[KeyCode::F, KeyCode::J]), vec![NoteKind::Don, NoteKind::Don]);
+        assert_eq!(keys.inputs_from_events(&[KeyCode::F, KeyCode::K]), vec![NoteKind::Don, NoteKind::Kat]);
     }
 
     #[test]
@@ -628,7 +1021,7 @@ mod tests {
             kat_left: KeyCode::D,
             kat_right: KeyCode::K,
         };
-        assert_eq!(keys.pressed_inputs_with(|key| key == KeyCode::F), vec![NoteKind::Don]);
+        assert_eq!(keys.inputs_from_events(&[KeyCode::F]), vec![NoteKind::Don]);
     }
 
     #[test]
@@ -646,6 +1039,21 @@ mod tests {
         assert_eq!(source.channels(), 2);
         assert_eq!(source.sample_rate(), 48_000);
         assert_eq!(source.count(), 4);
+    }
+
+    #[test]
+    fn song_pages_are_bounded_and_follow_selection() {
+        assert_eq!(song_page_start(0), 0);
+        assert_eq!(song_page_start(9), 0);
+        assert_eq!(song_page_start(10), 10);
+        assert_eq!(song_page_start(27), 20);
+    }
+
+    #[test]
+    fn balloon_stays_at_target_while_active() {
+        assert_eq!(balloon_position(0.5, 1.5, BPM120), scroll_x(0.5, BPM120));
+        assert_eq!(balloon_position(-0.25, 0.5, BPM120), TARGET_X);
+        assert_eq!(balloon_position(-1.0, -0.25, BPM120), scroll_x(-1.0, BPM120));
     }
 
     #[test]
