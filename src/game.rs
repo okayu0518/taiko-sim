@@ -41,11 +41,13 @@ enum Scene {
 struct SeData {
     samples: Arc<[f32]>,
     sample_rate: u32,
+    channels: u16,
 }
 
 struct SeSource {
     data: Arc<[f32]>,
     sample_rate: u32,
+    channels: u16,
     idx: usize,
     gain: f32,
     triggered_at: Instant,
@@ -75,7 +77,7 @@ impl Source for SeSource {
     fn current_frame_len(&self) -> Option<usize> {
         Some(self.data.len().saturating_sub(self.idx))
     }
-    fn channels(&self) -> u16 { 1 }
+    fn channels(&self) -> u16 { self.channels }
     fn sample_rate(&self) -> u32 { self.sample_rate }
     fn total_duration(&self) -> Option<Duration> { None }
 }
@@ -138,12 +140,22 @@ impl Keybinds {
         }
     }
 
-    fn don_pressed(&self) -> bool {
-        is_key_pressed(self.don_left) || is_key_pressed(self.don_right)
-    }
-
-    fn kat_pressed(&self) -> bool {
-        is_key_pressed(self.kat_left) || is_key_pressed(self.kat_right)
+    /// Preserve separate hits for each bound key, including simultaneous hits.
+    /// Duplicate mappings are processed once per physical key.
+    fn pressed_inputs_with(&self, pressed: impl Fn(KeyCode) -> bool) -> Vec<NoteKind> {
+        let bindings = [
+            (self.don_left, NoteKind::Don),
+            (self.don_right, NoteKind::Don),
+            (self.kat_left, NoteKind::Kat),
+            (self.kat_right, NoteKind::Kat),
+        ];
+        bindings.iter().enumerate().filter_map(|(i, &(key, kind))| {
+            if bindings[..i].iter().any(|&(previous, _)| previous == key) {
+                None
+            } else {
+                pressed(key).then_some(kind)
+            }
+        }).collect()
     }
 }
 
@@ -258,15 +270,10 @@ impl TaikoSimApp {
 
         self.effects.update(now);
 
-        if self.keybinds.don_pressed() {
-            self.play_key_se(NoteKind::Don);
-            self.effects.spawn_input(now, NoteKind::Don);
-            self.try_hit(now, NoteKind::Don);
-        }
-        if self.keybinds.kat_pressed() {
-            self.play_key_se(NoteKind::Kat);
-            self.effects.spawn_input(now, NoteKind::Kat);
-            self.try_hit(now, NoteKind::Kat);
+        for kind in self.keybinds.pressed_inputs_with(is_key_pressed) {
+            self.play_key_se(kind);
+            self.effects.spawn_input(now, kind);
+            self.try_hit(now, kind);
         }
         if is_key_pressed(KeyCode::LeftBracket) { self.adjust_timing_offset(-5); }
         if is_key_pressed(KeyCode::RightBracket) { self.adjust_timing_offset(5); }
@@ -423,7 +430,7 @@ impl TaikoSimApp {
             let (last_ms, avg_ms, max_ms, n) = self.se_latency_stats.snapshot_ms();
             self.draw_ui_text(&format!("FPS: {}", get_fps()), 1030.0, 40.0, 24, Color::from_rgba(170, 255, 170, 255));
             self.draw_ui_text(&format!("Time: {:.3}s", now), 1030.0, 68.0, 24, Color::from_rgba(170, 255, 170, 255));
-            self.draw_ui_text(&format!("SE Latency ms  last:{:.1} avg:{:.1} max:{:.1} n:{}", last_ms, avg_ms, max_ms, n), 700.0, 96.0, 24, Color::from_rgba(170, 255, 170, 255));
+            self.draw_ui_text(&format!("SE source-read ms  last:{:.1} avg:{:.1} max:{:.1} n:{}", last_ms, avg_ms, max_ms, n), 700.0, 96.0, 24, Color::from_rgba(170, 255, 170, 255));
             if let Some(se) = &self.se_don {
                 self.draw_ui_text(&format!("SE SampleRate: {}Hz", se.sample_rate), 700.0, 124.0, 24, Color::from_rgba(170, 255, 170, 255));
             }
@@ -529,6 +536,7 @@ impl TaikoSimApp {
         let source = SeSource {
             data: se_data.samples.clone(),
             sample_rate: se_data.sample_rate,
+            channels: se_data.channels,
             idx: 0,
             gain: self.config.se_volume.clamp(0.0, 2.0),
             triggered_at: Instant::now(), recorded: false,
@@ -563,8 +571,9 @@ fn load_se_data(path: &std::path::Path) -> Option<SeData> {
     let file = File::open(path).ok()?;
     let decoder = Decoder::new(BufReader::new(file)).ok()?;
     let sample_rate = decoder.sample_rate();
+    let channels = decoder.channels();
     let samples: Vec<f32> = decoder.convert_samples::<f32>().collect();
-    Some(SeData { samples: Arc::from(samples.into_boxed_slice()), sample_rate })
+    Some(SeData { samples: Arc::from(samples.into_boxed_slice()), sample_rate, channels })
 }
 
 fn resolve_audio_path(song: &SongEntry, wave: Option<&str>) -> Option<PathBuf> {
@@ -597,6 +606,47 @@ mod tests {
     use super::*;
 
     const BPM120: ScrollSpeed = ScrollSpeed { bpm: 120.0, scroll: 1.0 };
+
+    #[test]
+    fn left_right_and_mixed_same_frame_inputs_are_independent() {
+        let keys = Keybinds::from_config(&KeybindConfig::default());
+        assert_eq!(
+            keys.pressed_inputs_with(|key| key == KeyCode::F || key == KeyCode::J),
+            vec![NoteKind::Don, NoteKind::Don]
+        );
+        assert_eq!(
+            keys.pressed_inputs_with(|key| key == KeyCode::F || key == KeyCode::K),
+            vec![NoteKind::Don, NoteKind::Kat]
+        );
+    }
+
+    #[test]
+    fn duplicate_mapping_does_not_generate_multiple_inputs() {
+        let keys = Keybinds {
+            don_left: KeyCode::F,
+            don_right: KeyCode::F,
+            kat_left: KeyCode::D,
+            kat_right: KeyCode::K,
+        };
+        assert_eq!(keys.pressed_inputs_with(|key| key == KeyCode::F), vec![NoteKind::Don]);
+    }
+
+    #[test]
+    fn stereo_se_preserves_channel_count() {
+        let source = SeSource {
+            data: Arc::from(vec![0.1_f32, -0.1, 0.2, -0.2].into_boxed_slice()),
+            sample_rate: 48_000,
+            channels: 2,
+            idx: 0,
+            gain: 1.0,
+            triggered_at: Instant::now(),
+            recorded: false,
+            latency_stats: Arc::new(SeLatencyStats::new()),
+        };
+        assert_eq!(source.channels(), 2);
+        assert_eq!(source.sample_rate(), 48_000);
+        assert_eq!(source.count(), 4);
+    }
 
     #[test]
     fn object_at_hit_time_is_on_judge_circle() {
