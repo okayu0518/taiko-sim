@@ -557,7 +557,10 @@ impl TaikoSimApp {
         self.effects.draw_texts(now, target, |text, x, y, size, color| self.draw_ui_text(text, x, y, size, color));
 
         let branch_name = if chart.has_branch { format!(" [{:?}]", cur_branch) } else { "".to_string() };
-        self.draw_ui_text(&format!("{} [{} Lv{}]{}", chart.title, chart.course, chart.level, branch_name), 40.0, 56.0, 40, WHITE);
+        let course_name = self.courses.get(self.selected_course_idx)
+            .map(|c| c.name.as_str())
+            .unwrap_or(chart.course.as_str());
+        self.draw_ui_text(&format!("{} [{} Lv{}]{}", chart.title, course_name, chart.level, branch_name), 40.0, 56.0, 40, WHITE);
         self.draw_ui_text(&format!("Score: {}", session.score.score), 320.0, 570.0, 36, WHITE);
         self.draw_ui_text(&session.score.combo.to_string(), TARGET_X - 120.0, LANE_Y - 56.0, 54, Color::from_rgba(255, 240, 170, 255));
         self.draw_ui_text("F/J: Don  D/K: Kat  ESC: result", 40.0, 630.0, 30, Color::from_rgba(170, 180, 200, 255));
