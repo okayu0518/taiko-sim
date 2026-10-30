@@ -199,7 +199,7 @@ impl PlaySession {
             return HitOutcome::Roll;
         }
 
-        let Some((idx, delta)) = self.find_nearest_note(now, timing_offset_sec, kind) else {
+        let Some((idx, delta)) = self.find_earliest_hittable_note(now, timing_offset_sec, kind) else {
             return HitOutcome::Ignored;
         };
         let Some(judge) = judge_hit(delta) else {
@@ -255,7 +255,7 @@ impl PlaySession {
     /// windows overlap (common in dense charts), leaving the earlier one to
     /// expire as a miss. Branch parsing can also leave notes out of time order,
     /// so compare note times rather than relying on vector order.
-    fn find_nearest_note(&self, now: f64, timing_offset_sec: f64, kind: NoteKind) -> Option<(usize, f64)> {
+    fn find_earliest_hittable_note(&self, now: f64, timing_offset_sec: f64, kind: NoteKind) -> Option<(usize, f64)> {
         let mut best: Option<(usize, f64, f64)> = None;
         for (idx, note) in self.chart.notes.iter().enumerate() {
             if note.judged || note.kind != kind || !self.is_active(note.branch, note.time_sec) {
@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn nearest_matching_note_is_hit() {
+    fn earliest_matching_note_is_hit_without_consuming_other_colors() {
         let mut s = session_with_notes(vec![
             note(1.0, NoteKind::Don),
             note(1.05, NoteKind::Kat),
@@ -389,7 +389,7 @@ mod tests {
         ]);
         assert!(matches!(s.hit(1.04, 0.0, NoteKind::Don), HitOutcome::Note { .. }));
         let judged: Vec<_> = s.chart.notes.iter().map(|n| n.judged).collect();
-        assert_eq!(judged, vec![false, false, true]);
+        assert_eq!(judged, vec![true, false, false]);
     }
 
     #[test]
