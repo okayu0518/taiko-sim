@@ -1,6 +1,6 @@
 # taikosim
 
-Linux で動く、KISS 方針の太鼓系リズムゲームシミュレータです。  
+Linux / Windows で動く、KISS 方針の太鼓系リズムゲームシミュレータです。  
 **Rust で実装**し、ダウンロード済み `.tja` を選曲して遊べます。
 
 - `.tja` を読み込んでプレイ
@@ -48,11 +48,33 @@ sudo pacman -S --needed base-devel pkgconf alsa-lib
 ### ビルド確認
 
 ```bash
-git clone git@github.com:okayu0518/taiko-sim.git
+git clone https://github.com/okayu0518/taiko-sim.git
 cd taiko-sim
 cargo build
 cargo test
 ```
+
+## Windows用exe
+
+GitHub Actions の **Actions → CI → 対象の実行 → Artifacts → taikosim-windows-x64** から配布ZIPを取得できます。ZIPを展開し、`taikosim/taikosim.exe` を起動します。利用者にはRustのインストールは不要です。Windows 11上での動作は実機で確認してください。
+
+配布用のフォルダ構成:
+
+```text
+taikosim/
+  taikosim.exe
+  config.json
+  assets/
+    fonts/
+    se/
+  data/
+    songs/
+  README.md
+```
+
+配布版はexeの隣の `assets/`, `data/`, `config.json` を優先します。`cargo run` ではプロジェクトの作業ディレクトリからも読み込めます。 `config.example.json` は配布用の初期設定です。
+
+Windows上で直接ビルドする場合はRust（MSVC）とVisual Studio C++ Build Tools（Desktop development with C++）をインストールし、PowerShellから `cargo build --release` を実行してください。
 
 ## 2) サンプル譜面配置
 
@@ -113,9 +135,13 @@ cargo run
 
 `debug: true` のとき、プレイ画面右上に SE 遅延の簡易計測値を表示します。
 
-- `last`: 直近入力のSE再生開始までの時間（ms）
+- `last`: 直近入力からSEサンプルが初めて読み出されるまでの時間（ms）。実際のスピーカー出力遅延ではありません。
 - `avg`: 平均（ms）
 - `max`: 最大（ms）
+
+## 入力について
+
+左右Don（F/J）とKat（D/K）は個別に処理し、左右の同時押しも別々の入力になります。ただし `macroquad::is_key_pressed` を使うため、同一キーを1フレーム中に2回押しても2回の入力とは認識されません。SEの再生はサンプルレートとチャンネル数を保持してステレオ音源を正しく扱います。
 
 ## 操作
 
@@ -173,7 +199,7 @@ cargo test gameplay        # filter by module/test name
 
 ### CI
 
-GitHub Actions（`.github/workflows/ci.yml`）で `main` への push と Pull Request ごとに `cargo build --locked` と `cargo test --locked` を実行します（Ubuntu ランナー）。
+GitHub ActionsはUbuntuのビルド・テストに加え、Windows MSVCでのテスト・Releaseビルドと配布ZIPの生成を実行します。
 
 ## 文字コード対応
 

@@ -1,0 +1,16 @@
+{
+  "timing_offset_ms": 0,
+  "se_volume": 0.9,
+  "music_volume": 1.0,
+  "keybind": {
+    "don_left": "F",
+    "don_right": "J",
+    "kat_left": "D",
+    "kat_right": "K"
+  },
+  "vsync": true,
+  "font_path": null,
+  "debug": false,
+  "se_enabled": true,
+  "lead_in_sec": 3.0
+}
