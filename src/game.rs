@@ -30,6 +30,21 @@ const JUDGE_RING_RADIUS: f32 = 26.0;
 const LANE_X: f32 = 140.0;
 const LANE_W: f32 = 1110.0;
 const LANE_H: f32 = 120.0;
+const SONGS_PER_PAGE: usize = 10;
+const MENU_LIST_TOP: f32 = 171.0;
+const MENU_ROW_SPACING: f32 = 44.0;
+
+fn song_page_start(selected: usize) -> usize {
+    (selected / SONGS_PER_PAGE) * SONGS_PER_PAGE
+}
+
+fn balloon_position(start_diff: f64, end_diff: f64, speed: ScrollSpeed) -> f32 {
+    if start_diff <= 0.0 && end_diff >= 0.0 {
+        TARGET_X
+    } else {
+        scroll_x(start_diff, speed)
+    }
+}
 
 enum Scene {
     SongSelect,
@@ -475,43 +490,85 @@ impl TaikoSimApp {
     }
 
     fn draw_song_select(&self) {
-        clear_background(Color::from_rgba(24, 26, 33, 255));
-        self.draw_ui_text("Song Select", 60.0, 70.0, 56, WHITE);
-        self.draw_ui_text("D/K: song  J: difficulty / refresh  F: quit", 60.0, 105.0, 28, Color::from_rgba(170, 180, 200, 255));
+        self.draw_menu_header("SONG SELECT", "D/K: change song   J: difficulty   F: quit");
 
         if self.songs.is_empty() {
-            self.draw_ui_text("No songs found in data/songs - add TJA/audio, then press J", 60.0, 190.0, 30, RED);
+            self.draw_ui_text("No songs found", 100.0, 250.0, 34, WHITE);
+            self.draw_ui_text("Add TJA and audio to data/songs/<song>/", 100.0, 304.0, 24, Color::from_rgba(165, 183, 210, 255));
+            self.draw_ui_text("Press J to refresh the song list", 100.0, 344.0, 24, Color::from_rgba(255, 207, 118, 255));
             return;
         }
 
-        for (idx, song) in self.songs.iter().enumerate() {
+        let start = song_page_start(self.selected_idx);
+        let end = (start + SONGS_PER_PAGE).min(self.songs.len());
+        for (row, idx) in (start..end).enumerate() {
+            let song = &self.songs[idx];
             let selected = idx == self.selected_idx;
-            let color = if selected { Color::from_rgba(255, 230, 140, 255) } else { Color::from_rgba(230, 230, 230, 255) };
-            let label = format!("{}{} ({})", if selected { "> " } else { "  " }, song.title, song.song_id);
-            self.draw_ui_text(&label, 80.0, 170.0 + idx as f32 * 44.0, 38, color);
+            let baseline = MENU_LIST_TOP + row as f32 * MENU_ROW_SPACING + 29.0;
+            let y = baseline - 30.0;
+            self.draw_menu_row(y, selected);
+
+            let number_color = if selected {
+                Color::from_rgba(255, 216, 136, 255)
+            } else {
+                Color::from_rgba(117, 139, 170, 255)
+            };
+            self.draw_ui_text(&format!("{:02}", idx + 1), 98.0, baseline, 21, number_color);
+            self.draw_ui_fitted_text(
+                &song.title, 161.0, baseline, 27, 840.0,
+                if selected { WHITE } else { Color::from_rgba(203, 215, 235, 255) },
+            );
+            if selected {
+                self.draw_ui_text("SELECTED", 1024.0, baseline, 18, Color::from_rgba(255, 207, 118, 255));
+            }
         }
 
+        let page = start / SONGS_PER_PAGE + 1;
+        let pages = self.songs.len().div_ceil(SONGS_PER_PAGE);
+        self.draw_menu_footer(&format!(
+            "{} songs    Page {}/{}    Selected {}/{}",
+            self.songs.len(), page, pages, self.selected_idx + 1, self.songs.len()
+        ));
+
         if !self.error_message.is_empty() {
-            self.draw_ui_text(&self.error_message, 60.0, screen_height() - 40.0, 30, Color::from_rgba(255, 120, 120, 255));
+            self.draw_ui_fitted_text(
+                &self.error_message, 77.0, 622.0, 21, 1100.0,
+                Color::from_rgba(255, 141, 141, 255)
+            );
         }
     }
 
     fn draw_difficulty_select(&self) {
-        clear_background(Color::from_rgba(24, 26, 33, 255));
-        self.draw_ui_text("Select Difficulty", 60.0, 70.0, 56, WHITE);
-        self.draw_ui_text("D/K: difficulty   J: play   F: song select", 60.0, 105.0, 28, Color::from_rgba(170, 180, 200, 255));
+        self.draw_menu_header("DIFFICULTY", "D/K: choose difficulty   J: play   F: back");
 
         if let Some(song) = self.songs.get(self.selected_idx) {
-            self.draw_ui_text(&song.title, 60.0, 165.0, 38, WHITE);
+            self.draw_ui_fitted_text(
+                &song.title, 93.0, 190.0, 29, 1060.0,
+                Color::from_rgba(224, 232, 248, 255),
+            );
         }
+
         for (i, course) in self.courses.iter().enumerate() {
             let selected = i == self.selected_course_idx;
-            let label = format!("{}{}  Lv{}", if selected { "> " } else { "  " }, course.name, course.level);
-            let color = if selected { Color::from_rgba(255, 230, 140, 255) } else { WHITE };
-            self.draw_ui_text(&label, 80.0, 235.0 + 56.0 * i as f32, 36, color);
+            let baseline = 252.0 + 63.0 * i as f32;
+            self.draw_menu_row(baseline - 34.0, selected);
+            self.draw_ui_fitted_text(
+                &course.name, 119.0, baseline, 31, 720.0,
+                if selected { WHITE } else { Color::from_rgba(194, 210, 230, 255) },
+            );
+            self.draw_ui_text(
+                &format!("Lv {}", course.level), 970.0, baseline, 27,
+                if selected { Color::from_rgba(255, 210, 125, 255) }
+                else { Color::from_rgba(143, 163, 193, 255) },
+            );
         }
+        self.draw_menu_footer("Only difficulties present in this TJA file are shown");
+
         if !self.error_message.is_empty() {
-            self.draw_ui_text(&self.error_message, 60.0, screen_height() - 40.0, 28, RED);
+            self.draw_ui_fitted_text(
+                &self.error_message, 77.0, 621.0, 21, 1100.0,
+                Color::from_rgba(255, 141, 141, 255)
+            );
         }
     }
 
@@ -560,14 +617,17 @@ impl TaikoSimApp {
         let course_name = self.courses.get(self.selected_course_idx)
             .map(|c| c.name.as_str())
             .unwrap_or(chart.course.as_str());
-        self.draw_ui_text(&format!("{} [{} Lv{}]{}", chart.title, course_name, chart.level, branch_name), 40.0, 56.0, 40, WHITE);
+        self.draw_ui_fitted_text(&format!("{} [{} Lv{}]{}", chart.title, course_name, chart.level, branch_name), 40.0, 56.0, 35, 930.0, WHITE);
         self.draw_ui_text(&format!("Score: {}", session.score.score), 320.0, 570.0, 36, WHITE);
         self.draw_ui_text(&session.score.combo.to_string(), TARGET_X - 120.0, LANE_Y - 56.0, 54, Color::from_rgba(255, 240, 170, 255));
         self.draw_ui_text("F/J: Don  D/K: Kat  ESC: result", 40.0, 630.0, 30, Color::from_rgba(170, 180, 200, 255));
         self.draw_ui_text(&format!("Offset: {}ms ([ / ])", self.config.timing_offset_ms), 900.0, 570.0, 30, Color::from_rgba(220, 230, 255, 255));
 
-        if session.active_roll(now, offset).is_some() {
-            self.draw_ui_text(&format!("連打: {}", session.roll_hit_count), TARGET_X - 55.0, LANE_Y - 72.0, 30, Color::from_rgba(255, 245, 180, 255));
+        if let Some(roll) = session.active_roll(now, offset) {
+            let label = if roll.balloon { "BALLOON" } else { "ROLL" };
+            self.draw_ui_text(&format!("{}  {}", label, session.roll_hit_count),
+                TARGET_X - 110.0, LANE_Y - 82.0, 25,
+                Color::from_rgba(255, 232, 161, 255));
         }
 
         if self.config.debug {
@@ -598,40 +658,143 @@ impl TaikoSimApp {
 
             let start_x = scroll_x(start_diff, roll.head_speed);
             let end_x = scroll_x(end_diff, roll.tail_speed);
-            if start_x.max(end_x) < LANE_X || start_x.min(end_x) > LANE_X + LANE_W { continue; }
             let body_left = start_x.min(end_x).max(LANE_X);
             let body_right = start_x.max(end_x).min(LANE_X + LANE_W);
 
-            let base_color = if roll.balloon { Color::from_rgba(255, 200, 80, 255) } else if roll.big { Color::from_rgba(255, 160, 60, 255) } else { Color::from_rgba(255, 210, 90, 255) };
+            if roll.balloon {
+                // Balloons are a separate note type, not yellow drumroll bars.
+                let x = balloon_position(start_diff, end_diff, roll.head_speed);
+                let active = start_diff <= 0.0 && end_diff >= 0.0;
+                if active {
+                    // Show the remaining duration as a thin timer tail.
+                    let tail_right = end_x.clamp(TARGET_X, LANE_X + LANE_W);
+                    draw_rectangle(
+                        TARGET_X, LANE_Y + 48.0,
+                        (tail_right - TARGET_X).max(0.0), 5.0,
+                        Color::from_rgba(255, 185, 75, 190),
+                    );
+                } else if body_right > body_left {
+                    draw_rectangle(
+                        body_left, LANE_Y + 48.0, body_right - body_left, 5.0,
+                        Color::from_rgba(255, 185, 75, 120),
+                    );
+                }
+                if is_x_visible(x, 60.0) {
+                    draw_balloon(x, LANE_Y, active, now);
+                }
+                continue;
+            }
 
-            if body_right > body_left { draw_rectangle(body_left, LANE_Y - 12.0, body_right - body_left, 24.0, base_color); }
-            draw_circle(start_x, LANE_Y, 16.0, base_color);
-            draw_circle(end_x, LANE_Y, 16.0, base_color);
-            draw_circle_lines(start_x, LANE_Y, 16.0, 2.0, BLACK);
-            draw_circle_lines(end_x, LANE_Y, 16.0, 2.0, BLACK);
+            if start_x.max(end_x) < LANE_X || start_x.min(end_x) > LANE_X + LANE_W { continue; }
+
+            let color = if roll.big {
+                Color::from_rgba(255, 152, 60, 255)
+            } else {
+                Color::from_rgba(255, 207, 85, 255)
+            };
+            if body_right > body_left {
+                draw_rectangle(body_left, LANE_Y - 12.0, body_right - body_left, 24.0, color);
+                draw_rectangle(body_left, LANE_Y - 10.0, body_right - body_left, 6.0,
+                    Color::from_rgba(255, 243, 179, 170));
+            }
+            draw_circle(start_x, LANE_Y, if roll.big { 22.0 } else { 17.0 }, color);
+            draw_circle(end_x, LANE_Y, 16.0, color);
+            draw_circle_lines(start_x, LANE_Y, if roll.big { 22.0 } else { 17.0 }, 2.5,
+                Color::from_rgba(117, 68, 33, 255));
+            draw_circle_lines(end_x, LANE_Y, 16.0, 2.5, Color::from_rgba(117, 68, 33, 255));
         }
     }
 
     fn draw_result(&self) {
-        clear_background(Color::from_rgba(24, 26, 33, 255));
-        self.draw_ui_text("Result", 60.0, 70.0, 56, WHITE);
-        let song_name = self.current_song.as_ref().map(|s| s.title.clone()).unwrap_or_else(|| "Unknown".to_string());
-        let course = self.courses.get(self.selected_course_idx).map(|c| c.name.as_str()).unwrap_or("Unknown");
-        self.draw_ui_text(&format!("{}  [{}]", song_name, course), 80.0, 130.0, 36, Color::from_rgba(200, 220, 255, 255));
+        self.draw_menu_header("RESULT", "F: song select   J: replay   ESC: quit");
+        let song_name = self.current_song.as_ref()
+            .map(|s| s.title.as_str()).unwrap_or("Unknown");
+        let course = self.courses.get(self.selected_course_idx)
+            .map(|c| c.name.as_str()).unwrap_or("Unknown");
+        self.draw_ui_fitted_text(song_name, 92.0, 205.0, 34, 955.0, WHITE);
+        self.draw_ui_text(&format!("Difficulty: {}", course), 95.0, 245.0, 23,
+            Color::from_rgba(169, 191, 222, 255));
 
         let default_score = ScoreState::default();
         let score = self.session.as_ref().map_or(&default_score, |s| &s.score);
+        self.draw_ui_text("SCORE", 96.0, 316.0, 20,
+            Color::from_rgba(155, 175, 200, 255));
+        self.draw_ui_text(&score.score.to_string(), 95.0, 382.0, 56,
+            Color::from_rgba(255, 212, 132, 255));
+
         let stats = [
-            format!("Score: {}", score.score),
-            format!("Max Combo: {}", score.max_combo),
-            format!("良: {}", score.perfect),
-            format!("可: {}", score.good),
-            format!("不可: {}", score.miss),
+            ("MAX COMBO", score.max_combo),
+            ("RYO", score.perfect),
+            ("KA", score.good),
+            ("MISS", score.miss),
         ];
-        for (i, line) in stats.iter().enumerate() {
-            self.draw_ui_text(line, 80.0, 200.0 + i as f32 * 56.0, 40, Color::from_rgba(230, 230, 230, 255));
+        for (i, (name, value)) in stats.iter().enumerate() {
+            let x = 93.0 + i as f32 * 275.0;
+            self.draw_ui_rect(x, 436.0, 250.0, 100.0, Color::from_rgba(39, 54, 75, 255));
+            self.draw_ui_text(name, x + 17.0, 473.0, 20,
+                Color::from_rgba(153, 177, 207, 255));
+            self.draw_ui_text(&value.to_string(), x + 17.0, 515.0, 33, WHITE);
         }
-        self.draw_ui_text("F: song select  J: replay  (F again: quit)", 80.0, 640.0, 30, Color::from_rgba(170, 180, 200, 255));
+        self.draw_menu_footer("Press J to retry the selected difficulty");
+    }
+
+    fn draw_menu_header(&self, title: &str, controls: &str) {
+        clear_background(Color::from_rgba(17, 23, 35, 255));
+        self.draw_ui_rect(0.0, 0.0, BASE_W, 7.0, Color::from_rgba(255, 178, 98, 255));
+        self.draw_ui_rect(60.0, 139.0, 1160.0, 476.0, Color::from_rgba(29, 39, 56, 255));
+        self.draw_ui_rect(60.0, 139.0, 5.0, 476.0, Color::from_rgba(255, 178, 98, 255));
+        self.draw_ui_text(title, 68.0, 69.0, 44, WHITE);
+        self.draw_ui_fitted_text(controls, 71.0, 108.0, 20, 1120.0,
+            Color::from_rgba(169, 190, 216, 255));
+    }
+
+    fn draw_menu_row(&self, top: f32, selected: bool) {
+        self.draw_ui_rect(
+            84.0, top, 1109.0, 40.0,
+            if selected { Color::from_rgba(69, 81, 103, 255) }
+            else { Color::from_rgba(36, 48, 67, 255) },
+        );
+        if selected {
+            self.draw_ui_rect(84.0, top, 5.0, 40.0,
+                Color::from_rgba(255, 195, 105, 255));
+        }
+    }
+
+    fn draw_menu_footer(&self, text: &str) {
+        self.draw_ui_fitted_text(text, 81.0, 675.0, 19, 1118.0,
+            Color::from_rgba(158, 180, 207, 255));
+    }
+
+    fn draw_ui_rect(&self, x: f32, y: f32, w: f32, h: f32, color: Color) {
+        let sx = screen_width() / BASE_W;
+        let sy = screen_height() / BASE_H;
+        draw_rectangle(x * sx, y * sy, w * sx, h * sy, color);
+    }
+
+    /// Limit the rendered width to a measured pixel budget, preserving Unicode
+    /// character boundaries when inserting an ellipsis.
+    fn draw_ui_fitted_text(
+        &self, text: &str, x: f32, y: f32, font_size: u16,
+        max_width: f32, color: Color,
+    ) {
+        let sx = screen_width() / BASE_W;
+        let sy = screen_height() / BASE_H;
+        let scaled_size = ((font_size as f32 * sy).round() as u16).max(1);
+        let font = self.ui_font.as_ref();
+        let fits = |value: &str| measure_text(value, font, scaled_size, 1.0).width <= max_width * sx;
+        if fits(text) {
+            self.draw_ui_text(text, x, y, font_size, color);
+            return;
+        }
+        let mut clipped = text.to_owned();
+        while !clipped.is_empty() {
+            clipped.pop();
+            let candidate = format!("{}...", clipped);
+            if fits(&candidate) {
+                self.draw_ui_text(&candidate, x, y, font_size, color);
+                return;
+            }
+        }
     }
 
     fn draw_ui_text(&self, text: &str, x: f32, y: f32, font_size: u16, color: Color) {
@@ -696,6 +859,30 @@ impl TaikoSimApp {
             if let Ok((s, h)) = OutputStream::try_default() { self._audio_stream = Some(s); self.audio_handle = Some(h); }
         }
     }
+}
+
+/// Balloon/firmament-style note. The shape stays at the hit target while active.
+fn draw_balloon(x: f32, y: f32, active: bool, time: f64) {
+    let pulse = if active { ((time * 13.0).sin() as f32 + 1.0) * 2.0 } else { 0.0 };
+    let w = 47.0 + pulse;
+    let h = 36.0 + pulse * 0.7;
+    let outline = Color::from_rgba(108, 56, 46, 255);
+    // Shadow and the tied knot are separate from the oval so the silhouette
+    // can never be mistaken for an ordinary long roll.
+    draw_ellipse(x + 2.5, y + 3.0, w + 3.0, h + 3.0, 0.0,
+        Color::from_rgba(66, 44, 51, 180));
+    draw_ellipse(x, y, w, h, 0.0, Color::from_rgba(255, 150, 78, 255));
+    draw_ellipse(x - 6.0, y - 7.0, w - 9.0, h - 8.0, 0.0,
+        Color::from_rgba(255, 193, 100, 255));
+    draw_ellipse_lines(x, y, w, h, 0.0, 3.0, outline);
+    draw_ellipse(x - 16.0, y - 15.0, 13.0, 7.0, -25.0,
+        Color::from_rgba(255, 246, 207, 180));
+    draw_triangle(
+        vec2(x - 7.0, y + h - 3.0), vec2(x + 7.0, y + h - 3.0),
+        vec2(x, y + h + 11.0), Color::from_rgba(255, 164, 88, 255),
+    );
+    draw_line(x, y + h + 10.0, x + 6.0, y + h + 19.0, 2.0,
+        Color::from_rgba(255, 217, 143, 255));
 }
 
 /// Horizontal position of an object `diff_sec` seconds before its hit time.
@@ -816,6 +1003,21 @@ mod tests {
         assert_eq!(source.channels(), 2);
         assert_eq!(source.sample_rate(), 48_000);
         assert_eq!(source.count(), 4);
+    }
+
+    #[test]
+    fn song_pages_are_bounded_and_follow_selection() {
+        assert_eq!(song_page_start(0), 0);
+        assert_eq!(song_page_start(9), 0);
+        assert_eq!(song_page_start(10), 10);
+        assert_eq!(song_page_start(27), 20);
+    }
+
+    #[test]
+    fn balloon_stays_at_target_while_active() {
+        assert_eq!(balloon_position(0.5, 1.5, BPM120), scroll_x(0.5, BPM120));
+        assert_eq!(balloon_position(-0.25, 0.5, BPM120), TARGET_X);
+        assert_eq!(balloon_position(-1.0, -0.25, BPM120), scroll_x(-1.0, BPM120));
     }
 
     #[test]
