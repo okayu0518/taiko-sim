@@ -5,7 +5,65 @@ use encoding_rs::{SHIFT_JIS, UTF_8};
 
 use crate::models::{Branch, BranchCondition, BranchPoint, Chart, GogoRange, LevelHold, Note, NoteKind, Roll, ScrollSpeed};
 
-const COURSE_PRIORITY: [&str; 4] = ["oni", "hard", "normal", "easy"];
+const COURSE_PRIORITY: [&str; 5] = ["oni", "hard", "normal", "easy", "edit"];
+
+/// A selectable difficulty defined by a TJA `#START` block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CourseOption {
+    pub id: String,
+    pub name: String,
+    pub level: i32,
+}
+
+fn normalized_course(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "0" | "easy" => "easy".to_owned(),
+        "1" | "normal" => "normal".to_owned(),
+        "2" | "hard" => "hard".to_owned(),
+        "3" | "oni" => "oni".to_owned(),
+        "4" | "edit" | "ura" => "edit".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn display_course(raw: &str) -> String {
+    match normalized_course(raw).as_str() {
+        "easy" => "Easy".to_owned(),
+        "normal" => "Normal".to_owned(),
+        "hard" => "Hard".to_owned(),
+        "oni" => "Oni".to_owned(),
+        "edit" => "Ura (Edit)".to_owned(),
+        _ => raw.to_owned(),
+    }
+}
+
+/// List available courses without building all charts.
+pub fn list_courses(path: &Path) -> Result<Vec<CourseOption>, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let text = decode_tja_bytes(bytes);
+    list_courses_text(&text)
+}
+
+fn list_courses_text(text: &str) -> Result<Vec<CourseOption>, String> {
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let (blocks, _) = extract_course_blocks(&lines);
+    if blocks.is_empty() {
+        return Err("No #START/#END block found".to_owned());
+    }
+
+    let mut courses = Vec::new();
+    for b in blocks {
+        let id = b.headers.get("COURSE").cloned().unwrap_or_else(|| "Oni".to_owned());
+        if courses.iter().any(|c: &CourseOption| normalized_course(&c.id) == normalized_course(&id)) {
+            continue;
+        }
+        let level = b.headers.get("LEVEL")
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        courses.push(CourseOption { name: display_course(&id), id, level });
+    }
+    Ok(courses)
+}
 
 #[derive(Clone)]
 struct CourseBlock {
@@ -122,7 +180,7 @@ fn select_block<'a>(blocks: &'a [CourseBlock], preferred_course: Option<&str>) -
             if b
                 .headers
                 .get("COURSE")
-                .map(|c| c.trim().eq_ignore_ascii_case(&p))
+                .map(|c| normalized_course(c) == normalized_course(&p))
                 .unwrap_or(false)
             {
                 return b;
@@ -135,7 +193,7 @@ fn select_block<'a>(blocks: &'a [CourseBlock], preferred_course: Option<&str>) -
             if b
                 .headers
                 .get("COURSE")
-                .map(|c| c.trim().eq_ignore_ascii_case(name))
+                .map(|c| normalized_course(c) == name)
                 .unwrap_or(false)
             {
                 return b;
@@ -589,6 +647,35 @@ mod tests {
         assert_eq!(parse(MULTI_COURSE, None).course, "Oni");
         let src = "COURSE:Easy\n#START\n1,\n#END\nCOURSE:Normal\n#START\n1,\n#END\n";
         assert_eq!(parse(src, None).course, "Normal");
+    }
+
+    #[test]
+    fn difficulty_list_includes_ura_with_levels() {
+        let tja = "TITLE:Test\nCOURSE:0\nLEVEL:2\n#START\n1,\n#END\nCOURSE:3\nLEVEL:9\n#START\n1,\n#END\nCOURSE:4\nLEVEL:10\n#START\n2,\n#END\n";
+        let courses = list_courses_text(tja).unwrap();
+        assert_eq!(courses, vec![
+            CourseOption { id: "0".into(), name: "Easy".into(), level: 2 },
+            CourseOption { id: "3".into(), name: "Oni".into(), level: 9 },
+            CourseOption { id: "4".into(), name: "Ura (Edit)".into(), level: 10 },
+        ]);
+        assert_eq!(parse(tja, Some("Ura")).course, "4");
+        assert_eq!(parse(tja, Some("Edit")).level, 10);
+        assert_eq!(parse(tja, Some("Oni")).level, 9);
+    }
+
+    #[test]
+    fn duplicate_aliases_collapse_to_one_difficulty() {
+        let tja = "COURSE:Edit\nLEVEL:10\n#START\n2,\n#END\nCOURSE:Ura\n#START\n2,\n#END\n";
+        assert_eq!(list_courses_text(tja).unwrap().len(), 1);
+        assert_eq!(parse(tja, Some("4")).course, "Edit");
+    }
+
+    #[test]
+    fn no_course_metadata_still_has_a_selectable_default() {
+        let courses = list_courses_text("#START\n1,\n#END").unwrap();
+        assert_eq!(courses[0].name, "Oni");
+        assert_eq!(courses[0].level, 0);
+        assert!(list_courses_text("TITLE:Missing").is_err());
     }
 
     #[test]
